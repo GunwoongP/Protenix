@@ -181,6 +181,11 @@ _REQUIRED_FEATURES: dict[str, set[str]] = {
         "experimental_torsion_force_constant",
         "experimental_torsion_sign",
     },
+    "TemplateReferencePotential": {
+        "template_cb",
+        "template_mask_cb",
+        "token_centre_atom_idx",
+    },
 }
 
 
