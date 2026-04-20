@@ -1377,3 +1377,120 @@ class VinaStericPotential(Potential):
         if len(batch_shape) == 0:
             return e_out[0], g_out
         return e_out.reshape(*batch_shape), g_out
+
+
+@register
+class TemplateReferencePotential(Potential):
+    """Pull atoms toward template reference coordinates (flat-bottom upper bound).
+
+    Given a structural template (e.g. an FFT-docked pose), softly guide the
+    diffusion trajectory to stay within `threshold` of the template at atoms
+    flagged by `template_ref_mask`. Useful for template-constrained refinement
+    where the overall pose is approximately known but fine structure needs
+    relaxation.
+
+    Ported from Boltz-2's `TemplateReferencePotential` (NVIDIA NIM
+    tensorrt_bionemo) but adapted to Protenix TFG's atom-indexed signature
+    (full `[..., N_atom, 3]` coords instead of per-token slicing).
+
+    Algorithm
+    ---------
+    1. Rigid-align the template reference onto current `coords` using
+       `weighted_rigid_align` (AF3 Algorithm 28). This strips out rigid-body
+       translation/rotation differences between the template frame and the
+       currently denoised pose — only deformation is penalized.
+    2. Per-atom residual `r_i = coord_i - aligned_ref_i`.
+    3. Flat-bottom upper-bound energy on `||r_i||` with threshold `t_i`.
+       Atoms with `template_ref_mask[i] = False` contribute zero.
+
+    Expected feats
+    --------------
+    template_ref_coords : `[N_atom, 3]` or `[..., N_atom, 3]`
+        Template atom positions in the Protenix atom ordering. Positions for
+        masked-out atoms are ignored.
+    template_ref_mask : `[N_atom]` (bool or 0/1)
+        True where a valid template reference exists for that atom.
+
+    Optional feats
+    --------------
+    template_ref_threshold : scalar or `[N_atom]`
+        Per-atom distance cutoff. If absent, falls back to param `threshold`.
+
+    Params
+    ------
+    threshold : float, default 2.0
+        Default per-atom distance cutoff (Å) when `template_ref_threshold`
+        feat is not provided.
+    mode : {"parabolic", "linear"}, default "parabolic"
+        Shape of the flat-bottom penalty beyond `threshold`.
+    rigid_align : bool, default True
+        If True, run `weighted_rigid_align` before computing per-atom residual.
+        Disable only if the template is already in the predicted frame.
+    """
+
+    def __init__(self, default_params: Optional[dict[str, Any]] = None):
+        defaults = {"threshold": 2.0, "mode": "parabolic", "rigid_align": True}
+        if default_params is not None:
+            defaults.update(default_params)
+        super().__init__(defaults)
+
+    def _eval(self, coords, feats, params, need_grad: bool):
+        ref = feats.get("template_ref_coords", None)
+        mask = feats.get("template_ref_mask", None)
+        if ref is None or mask is None:
+            return (
+                _zeros_energy_and_grad(coords) if need_grad else _zeros_energy(coords)
+            )
+
+        mask_f = mask.to(coords.dtype)  # [N_atom] or [..., N_atom]
+        if mask_f.sum() == 0:
+            return (
+                _zeros_energy_and_grad(coords) if need_grad else _zeros_energy(coords)
+            )
+
+        ref_f = ref.to(coords.dtype).to(coords.device)
+        if ref_f.shape[:-1] != coords.shape[:-1]:
+            # Broadcast [N_atom, 3] → [..., N_atom, 3]
+            ref_f = ref_f.expand_as(coords)
+
+        # Rigid-align template onto current coords (translation/rotation only).
+        if bool(params.get("rigid_align", True)):
+            from protenix.metrics.rmsd import weighted_rigid_align
+
+            ref_aligned = weighted_rigid_align(
+                x=ref_f, x_target=coords, atom_weight=mask_f, stop_gradient=True
+            )
+        else:
+            ref_aligned = ref_f
+
+        diff = coords - ref_aligned  # [..., N_atom, 3]
+        dist = torch.linalg.norm(diff, dim=-1).clamp_min(1e-8)  # [..., N_atom]
+
+        # Per-atom threshold (feat override > param default)
+        t_feat = feats.get("template_ref_threshold", None)
+        if t_feat is not None:
+            t_feat = _to_tensor(t_feat, coords.device, dist.dtype)
+            if t_feat.ndim == 0:
+                upper = t_feat.expand_as(dist)
+            else:
+                upper = t_feat.to(dist.dtype).expand_as(dist)
+        else:
+            upper = torch.full_like(dist, float(params["threshold"]))
+
+        k = torch.ones_like(dist)
+        mode = str(params.get("mode", "parabolic")).lower()
+        if mode == "linear":
+            e, de_dd = _flat_bottom_linear(dist, k, None, upper)
+        else:
+            e, de_dd = _flat_bottom_parabolic(dist, k, None, upper)
+
+        # Apply mask (atoms without template contribute 0).
+        e = e * mask_f
+        if not need_grad:
+            return _sum_energy(e)
+
+        # dE/dx = dE/d(dist) * d(dist)/dx = de_dd * (diff / dist)
+        direction = diff / dist.unsqueeze(-1)
+        grad_atom = (de_dd * mask_f).unsqueeze(-1) * direction
+        return _sum_energy(e), grad_atom
+
