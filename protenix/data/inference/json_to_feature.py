@@ -401,4 +401,15 @@ class SampleDictToFeatures:
             )
             feature_dict.update(geometry_featurizer.get_features())
 
+            # Optional: template reference features (for TemplateReferencePotential).
+            # Extracted only when the input dict carries a top-level `templates` list.
+            from protenix.data.inference.template_reference import (
+                build_template_reference_features,
+            )
+            feature_dict.update(
+                build_template_reference_features(
+                    self.input_dict, atom_array, token_array
+                )
+            )
+
         return feature_dict, atom_array, token_array
