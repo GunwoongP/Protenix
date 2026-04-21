@@ -1536,12 +1536,15 @@ class TemplateReferencePotential(Potential):
             diff = token_coords - ref_aligned  # [..., N_token, 3]
             dist = torch.linalg.norm(diff, dim=-1).clamp_min(1e-8)  # [..., N_token]
 
-            upper = torch.full_like(dist, float(thresholds[k]))
-            kk = torch.ones_like(dist)
+            # `thresholds[k]` is a 0-d device tensor; relying on broadcast
+            # inside `_flat_bottom_*` keeps this loop host-sync-free.
+            # (Previously: `torch.full_like(dist, float(thresholds[k]))` forced
+            # a device-to-host copy per template per step.)
+            upper = thresholds[k]
             if mode == "linear":
-                e, de_dd = _flat_bottom_linear(dist, kk, None, upper)
+                e, de_dd = _flat_bottom_linear(dist, 1.0, None, upper)
             else:
-                e, de_dd = _flat_bottom_parabolic(dist, kk, None, upper)
+                e, de_dd = _flat_bottom_parabolic(dist, 1.0, None, upper)
 
             e = e * mask_tok
             total_energy = total_energy + e.sum(dim=-1)

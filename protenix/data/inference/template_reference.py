@@ -304,19 +304,14 @@ def build_template_reference_features(
             t_chain = chain_map.get(q_chain, q_chain)  # identity default
             off = offsets.get(q_chain, 0)
             t_res = q_res - off
-            key = (t_chain, t_res, q_atom)
-            coord = lookup.get(key)
+            # The potential pulls the query's centre atom toward
+            # `template_cb[tok_i]`, so the template coord *must* come from
+            # the same atom name as the query's centre atom. A CA→CB
+            # fallback would shift the target by ~1.5 Å and silently bias
+            # the restraint. If the template is missing that atom, we
+            # leave the token mask at False.
+            coord = lookup.get((t_chain, t_res, q_atom))
             if coord is None:
-                # Some protein residues use CA as centre atom even when CB would
-                # be preferred — upstream templates may disagree. Fall through
-                # to CB fallback only if this token is a standard protein CA.
-                if q_atom == "CA":
-                    fallback = lookup.get((t_chain, t_res, "CB"))
-                    if fallback is not None:
-                        template_cb[k, tok_i] = fallback
-                        template_mask_cb[k, tok_i] = True
-                        hit += 1
-                        continue
                 continue
             template_cb[k, tok_i] = coord
             template_mask_cb[k, tok_i] = True
