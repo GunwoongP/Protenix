@@ -210,6 +210,20 @@ class InferenceDataset(Dataset):
             dummy_feats=dummy_feats,
         )
 
+        # After dummy fill, override trunk template features from a user-supplied
+        # `templates` list (Boltz-style JSON schema). This runs unconditionally —
+        # for models with template_embedder.n_blocks=0 (e.g. protenix v1) these
+        # feats are harmless extras; for protenix v2 (n_blocks=2) they activate
+        # the template pathway through the pairformer.
+        if single_sample_dict.get("templates"):
+            from protenix.data.inference.template_reference import (
+                build_trunk_template_features,
+            )
+            trunk_tmpl = build_trunk_template_features(
+                single_sample_dict, atom_array, token_array
+            )
+            features_dict.update(trunk_tmpl)
+
         # Transform to right data type
         feat = data_type_transform(feat_or_label_dict=features_dict)
 

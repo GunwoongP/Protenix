@@ -241,6 +241,16 @@ model_configs = {
                     "weight": 0.25,
                     "buffer": 0.08726646259,
                 },
+                "TemplateReferencePotential": {
+                    # Disabled by default; enable via
+                    #   --sample_diffusion.guidance.terms.TemplateReferencePotential.interval 1
+                    # in combination with a `templates: [...]` field in the input JSON.
+                    "interval": -1,
+                    "weight": 1.0,
+                    "threshold": 2.0,
+                    "mode": "parabolic",
+                    "rigid_align": True,
+                },
             },
         },
     },

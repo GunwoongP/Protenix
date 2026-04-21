@@ -508,8 +508,19 @@ class Protenix(nn.Module):
             mc_dropout=mc_dropout,
         )
 
+        # TFG TemplateReferencePotential consumes these DOWNSTREAM of the
+        # trunk — exclude them from the post-trunk memory-cleanup deletion.
+        # (Boltz-compatible naming; see protenix/tfg/potentials.py.)
+        _tfg_template_ref_keys = {
+            "template_cb",
+            "template_mask_cb",
+            "template_force",
+            "template_force_threshold",
+        }
         keys_to_delete = []
         for key in input_feature_dict.keys():
+            if key in _tfg_template_ref_keys:
+                continue
             if "template_" in key or key in [
                 "msa",
                 "has_deletion",
