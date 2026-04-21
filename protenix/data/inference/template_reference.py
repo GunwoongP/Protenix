@@ -44,8 +44,19 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-def _read_template_atom_lookup(cif_path: str) -> dict[tuple[str, int, str], np.ndarray]:
-    """Parse a template mmCIF into a (chain_id, res_id, atom_name) → coord lookup.
+def _read_template_atom_lookup(
+    cif_path: str,
+) -> tuple[dict[tuple[str, int, str], np.ndarray], dict[tuple[str, int], str]]:
+    """Parse a template mmCIF into two lookups keyed by residue position.
+
+    Returns
+    -------
+    atom_lookup : ``(chain_id, res_id, atom_name) -> coord``
+    res_name_by_pos : ``(chain_id, res_id) -> residue 3-letter name``
+        The residue-name map lets callers key embedding/atom-list decisions on
+        the *template's* residue identity rather than the query's, which
+        matters when the query and template have mismatched residues at the
+        aligned position.
 
     Some CIFs (e.g. computationally generated ones without MODEL records)
     are missing the `_atom_site.pdbx_PDB_model_num` column. biotite's
@@ -63,6 +74,7 @@ def _read_template_atom_lookup(cif_path: str) -> dict[tuple[str, int, str], np.n
         aa = get_structure(cif, model=1)
         chain_ids = aa.chain_id
         res_ids = aa.res_id
+        res_names = aa.res_name
         atom_names = aa.atom_name
         coords = aa.coord
     except KeyError as e:
@@ -88,6 +100,7 @@ def _read_template_atom_lookup(cif_path: str) -> dict[tuple[str, int, str], np.n
             [int(r) if r not in (".", "?", "") else -1 for r in res_ids],
             dtype=np.int64,
         )
+        res_names = _get("label_comp_id")
         atom_names = _get("label_atom_id")
         x = atom_site["Cartn_x"].as_array(np.float32)
         y = atom_site["Cartn_y"].as_array(np.float32)
@@ -95,13 +108,17 @@ def _read_template_atom_lookup(cif_path: str) -> dict[tuple[str, int, str], np.n
         coords = np.stack([x, y, z], axis=-1)
 
     lookup: dict[tuple[str, int, str], np.ndarray] = {}
+    res_name_by_pos: dict[tuple[str, int], str] = {}
     for i in range(len(coords)):
         rid = int(res_ids[i])
         if rid < 0:
             continue
-        key = (str(chain_ids[i]), rid, str(atom_names[i]))
-        lookup[key] = coords[i]
-    return lookup
+        chain = str(chain_ids[i])
+        lookup[(chain, rid, str(atom_names[i]))] = coords[i]
+        # First occurrence wins; subsequent atoms at the same residue share
+        # the residue name, so skip the dict write when already seen.
+        res_name_by_pos.setdefault((chain, rid), str(res_names[i]))
+    return lookup, res_name_by_pos
 
 
 # Three-letter residue code → one-letter code (proteins + common nucleic acids)
@@ -265,42 +282,17 @@ def build_template_reference_features(
         template_threshold[k] = float(tmpl.get("threshold", 2.0))
         chain_map = dict(tmpl.get("chain_mapping", {}) or {})
 
-        lookup = _read_template_atom_lookup(cif_path)
+        lookup, res_name_by_pos = _read_template_atom_lookup(cif_path)
 
-        # Derive per-chain template sequence from CA entries (proteins).
+        # Derive per-chain template sequence from the residue-name map; CA
+        # atoms exist for all protein residues so keyed iteration matches the
+        # old CA-scan behaviour without a second CIF pass.
         template_chain_seqs: dict[str, list[tuple[int, str]]] = {}
-        _seen_t: set[tuple[str, int]] = set()
-        for (t_c, t_r, t_a), _coord in lookup.items():
-            if t_a != "CA" or (t_c, t_r) in _seen_t:
-                continue
-            # Need res_name; lookup key doesn't have it, so scan atoms of that residue.
-            # Template res3: find any atom with (t_c, t_r) and read any 3-letter code.
-            # Simpler: rebuild mapping from atoms. Do one pass outside.
-            _seen_t.add((t_c, t_r))
-        # Rebuild with res_name by re-reading CIF (done once per template).
-        from biotite.structure.io.pdbx import CIFFile as _CIF
-        _cif = _CIF.read(cif_path)
-        _as = _cif.block["atom_site"]
-        _ch = _as["auth_asym_id"].as_array() if "auth_asym_id" in _as else _as["label_asym_id"].as_array()
-        _rn = _as["label_comp_id"].as_array()
-        _ri_raw = _as["label_seq_id"].as_array() if "label_seq_id" in _as else _as["auth_seq_id"].as_array()
-        _an = _as["label_atom_id"].as_array()
-        for i in range(len(_an)):
-            if _an[i] != "CA":
-                continue
-            try:
-                r = int(_ri_raw[i])
-            except (TypeError, ValueError):
-                continue
-            c = str(_ch[i])
-            key2 = (c, r)
-            c1 = _RES3_TO_1.get(str(_rn[i]))
+        for (t_chain_id, t_res_id), res3 in res_name_by_pos.items():
+            c1 = _RES3_TO_1.get(str(res3))
             if c1 is None:
                 continue
-            template_chain_seqs.setdefault(c, [])
-            # Avoid duplicate
-            if not template_chain_seqs[c] or template_chain_seqs[c][-1][0] != r:
-                template_chain_seqs[c].append((r, c1))
+            template_chain_seqs.setdefault(t_chain_id, []).append((t_res_id, c1))
         for c in template_chain_seqs:
             template_chain_seqs[c].sort()
 
@@ -427,8 +419,6 @@ def build_trunk_template_features(
     atom_positions = np.zeros((n_tmpl, n_token, N_dense, 3), dtype=np.float32)
     atom_mask = np.zeros((n_tmpl, n_token, N_dense), dtype=np.float32)
 
-    from biotite.structure.io.pdbx import CIFFile as _CIF
-
     for k, tmpl in enumerate(templates):
         cif_path = tmpl["cif"]
         if not os.path.isabs(cif_path):
@@ -437,30 +427,15 @@ def build_trunk_template_features(
             )
         chain_map = dict(tmpl.get("chain_mapping", {}) or {})
 
-        lookup = _read_template_atom_lookup(cif_path)
+        lookup, res_name_by_pos = _read_template_atom_lookup(cif_path)
 
-        # Extract template per-chain sequence from CA entries.
-        _cif = _CIF.read(cif_path)
-        _as = _cif.block["atom_site"]
-        _ch = _as["auth_asym_id"].as_array() if "auth_asym_id" in _as else _as["label_asym_id"].as_array()
-        _rn = _as["label_comp_id"].as_array()
-        _ri_raw = _as["label_seq_id"].as_array() if "label_seq_id" in _as else _as["auth_seq_id"].as_array()
-        _an = _as["label_atom_id"].as_array()
+        # Extract template per-chain sequence from the residue-name map.
         template_chain_seqs: dict[str, list[tuple[int, str]]] = {}
-        for i in range(len(_an)):
-            if _an[i] != "CA":
-                continue
-            try:
-                r = int(_ri_raw[i])
-            except (TypeError, ValueError):
-                continue
-            c = str(_ch[i])
-            c1 = _RES3_TO_1.get(str(_rn[i]))
+        for (t_chain_id, t_res_id), res3 in res_name_by_pos.items():
+            c1 = _RES3_TO_1.get(str(res3))
             if c1 is None:
                 continue
-            template_chain_seqs.setdefault(c, [])
-            if not template_chain_seqs[c] or template_chain_seqs[c][-1][0] != r:
-                template_chain_seqs[c].append((r, c1))
+            template_chain_seqs.setdefault(t_chain_id, []).append((t_res_id, c1))
         for c in template_chain_seqs:
             template_chain_seqs[c].sort()
 
@@ -470,17 +445,25 @@ def build_trunk_template_features(
         for tok_i, (q_chain, q_res, q_res3) in enumerate(
             zip(q_chain_ids, q_res_ids, q_res_names)
         ):
-            if q_res3 not in ATOM14:
-                # Non-standard residue (e.g. ligand token, modified); skip.
+            t_chain = chain_map.get(q_chain, q_chain)
+            t_res = q_res - offsets.get(q_chain, 0)
+
+            # Boltz convention: template aatype / atom list follow the
+            # TEMPLATE residue identity, not the query's. Fall back to the
+            # query residue only when the template has no residue at the
+            # aligned position (leaves mask=0 for that token either way).
+            t_res3 = res_name_by_pos.get((t_chain, t_res))
+            if t_res3 is None or t_res3 not in ATOM14:
+                t_res3 = q_res3 if q_res3 in ATOM14 else None
+            if t_res3 is None:
+                # Non-standard residue on both sides; cannot fill ATOM14 slots.
                 continue
-            one_letter = _THREE_TO_ONE.get(q_res3)
+            one_letter = _THREE_TO_ONE.get(t_res3)
             if one_letter is None or one_letter not in _ONE_TO_IDX:
                 continue
             aatype[k, tok_i] = _ONE_TO_IDX[one_letter]
 
-            t_chain = chain_map.get(q_chain, q_chain)
-            t_res = q_res - offsets.get(q_chain, 0)
-            atom_names = ATOM14[q_res3]  # canonical per-residue order
+            atom_names = ATOM14[t_res3]  # canonical per-residue order (template)
             res_hit = False
             for slot, name in enumerate(atom_names):
                 key = (t_chain, t_res, name)

@@ -1510,11 +1510,19 @@ class TemplateReferencePotential(Potential):
         for k in range(n_active):
             ref_tok = template_cb[k]  # [N_token, 3]
             mask_tok = template_mask_cb[k]  # [N_token]
-            if mask_tok.sum() == 0:
+            if not torch.any(mask_tok):
                 continue
 
-            # Broadcast ref to coords batch shape
-            ref_expanded = ref_tok.expand_as(token_coords)
+            # Broadcast ref to coords batch shape. `token_coords` may carry
+            # arbitrary leading batch dims (`[..., N_token, 3]`) while
+            # `ref_tok` is `[N_token, 3]`; add size-1 leading dims so the
+            # shapes line up before expand.
+            extra = token_coords.ndim - ref_tok.ndim
+            if extra > 0:
+                ref_expanded = ref_tok.reshape((1,) * extra + ref_tok.shape)
+                ref_expanded = ref_expanded.expand_as(token_coords)
+            else:
+                ref_expanded = ref_tok.expand_as(token_coords)
             if rigid:
                 ref_aligned = weighted_rigid_align(
                     x=ref_expanded,
