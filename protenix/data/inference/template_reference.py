@@ -365,8 +365,11 @@ def build_trunk_template_features(
     ------
     template_aatype         : [N_tmpl, N_token]               int64
     template_atom_positions : [N_tmpl, N_token, N_dense, 3]   float32
-    template_atom_mask      : [N_tmpl, N_token, N_dense]      float32
+    template_atom_mask      : [N_tmpl, N_token, N_dense]      bool
         where N_dense = 24 (Protenix DENSE_ATOM convention, sized for NA+protein).
+        `atom_mask` matches the existing template pipeline, which expects a
+        boolean-castable mask (`TemplateFeatureAssemblyLine` calls
+        `.astype(bool)`).
     """
     templates = input_dict.get("templates", []) or []
     if not templates:
@@ -391,6 +394,7 @@ def build_trunk_template_features(
     # template pipeline (see `data/template/template_utils.py:181`).
     _ONE_TO_IDX = {c: i for i, c in enumerate(PROTEIN_TYPES_ONE_LETTER)}
     _THREE_TO_ONE = {v: k for k, v in PROTEIN_COMMON_ONE_TO_THREE.items()}
+    _PROTEIN_3LETTERS = set(PROTEIN_COMMON_ONE_TO_THREE.values())  # 20 standard AAs
     UNK_IDX = len(PROTEIN_TYPES_ONE_LETTER)  # 20
     GAP_IDX = STD_RESIDUES_WITH_GAP["-"]  # 31
 
@@ -474,8 +478,15 @@ def build_trunk_template_features(
             t_chain = chain_map.get(q_chain, q_chain)
             t_res = q_res - offsets.get(q_chain, 0)
 
+            # UNK(20)/GAP(31) one-hot signals only make sense for protein
+            # tokens — ligand / per-atom / non-protein tokens stay at GAP
+            # regardless of what the template happens to carry at the
+            # aligned (t_chain, t_res).
+            if q_res3 not in _PROTEIN_3LETTERS:
+                continue
+
             # Boltz convention: template aatype / atom list follow the
-            # TEMPLATE residue identity. Three cases:
+            # TEMPLATE residue identity. Three cases for protein tokens:
             #   (a) no residue at (t_chain, t_res)  → aatype=GAP, mask=0
             #   (b) residue present but non-standard (not in ATOM14)
             #       → aatype=UNK (embedder sees "residue exists, type
