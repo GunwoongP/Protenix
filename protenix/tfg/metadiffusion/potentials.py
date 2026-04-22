@@ -509,7 +509,17 @@ class MetadynamicsPotential(Potential):
         params: dict[str, Any],
         need_grad: bool,
     ):
-        self._call_counter += 1
+        # CRITICAL (Copilot #2): MetadynamicsPotential is stateful.
+        # TFG invokes potentials on BOTH the energy-only path (MC logp
+        # estimate in `_logp_x0`) and the energy-and-grad path (actual
+        # x0 refinement). If we counted calls and deposited hills on
+        # every invocation, a single diffusion step would advance
+        # `_call_counter` by ``1 + eps_batch`` and pollute the bias
+        # surface with duplicate hills. The fix: only mutate state
+        # when ``need_grad=True`` — i.e. when the engine is about to
+        # actually apply our gradient to coordinates.
+        if need_grad:
+            self._call_counter += 1
 
         if not _window_active(params):
             if _debug_enabled(params):
@@ -538,7 +548,9 @@ class MetadynamicsPotential(Potential):
         # Deposit hill every `hill_interval` engine calls.
         # Hill center is always the batch-mean CV (hills are a
         # shared-state object; one hill per step covers the ensemble).
-        if self._call_counter % hill_interval == 0:
+        # Deposition is also gated on `need_grad` so energy-only
+        # evaluations don't pollute the bias surface (Copilot #2).
+        if need_grad and self._call_counter % hill_interval == 0:
             cv_for_hill = float(cv_value.float().mean().item())
             if well_tempered:
                 h_i = self._well_tempered_height(hill_h0, cv_for_hill, kT, bias_factor)
