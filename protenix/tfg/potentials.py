@@ -1456,12 +1456,15 @@ class TemplateReferencePotential(Potential):
             template_cb = template_cb.unsqueeze(0)
             template_mask_cb = template_mask_cb.unsqueeze(0)
 
-        # Filter templates by force flag (default: use all)
+        # Filter templates by force flag (default: use all). `template_force`
+        # can arrive on CPU even when `template_cb` has already been moved to
+        # the model device by the collator, so align the mask to the data
+        # tensor before indexing to avoid a device-mismatch error.
         force = feats.get("template_force", None)
         if force is not None:
-            force_mask = force.to(torch.bool)
+            force_mask = force.to(torch.bool).to(template_cb.device)
             template_cb = template_cb[force_mask]
-            template_mask_cb = template_mask_cb[force_mask]
+            template_mask_cb = template_mask_cb[force_mask.to(template_mask_cb.device)]
             n_active = int(template_cb.shape[0])
             if n_active == 0:
                 return (
@@ -1471,7 +1474,8 @@ class TemplateReferencePotential(Potential):
                 )
             thresh_feat = feats.get("template_force_threshold", None)
             if thresh_feat is not None:
-                thresholds = thresh_feat[force_mask].to(coords.dtype).to(coords.device)
+                thresh_feat = thresh_feat[force_mask.to(thresh_feat.device)]
+                thresholds = thresh_feat.to(coords.dtype).to(coords.device)
             else:
                 thresholds = torch.full(
                     (n_active,),
