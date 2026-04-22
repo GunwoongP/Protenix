@@ -462,6 +462,7 @@ def parse_tfg_config(guidance_cfg: Mapping[str, Any] | None) -> TFGConfig:
         "log_last_step_energy",
         "metadiffusion",  # Boltz-compatible metadiffusion list
         "metadiffusion_globals",  # engine-level knobs emitted by the parser
+        "total_bias_clip",  # also accepted at top level (Copilot #9)
     }
     extra = set(cfg.keys()) - allowed_top
     if extra:

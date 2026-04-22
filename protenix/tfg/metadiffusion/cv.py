@@ -557,10 +557,16 @@ def max_diameter_cv(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Soft-max approximation of the maximum pairwise distance.
 
-    Because ``torch.max`` is non-smooth, we use
-    ``d_max ≈ (Σ exp(β·d_ij)) / (Σ exp(β·d_ij) / d_ij)`` for large β
-    (smooth soft-max). Default β = 5 gives a tight approximation to the
-    true max while keeping gradients continuous.
+    Because ``torch.max`` is non-smooth, we approximate it with the
+    LogSumExp (LSE) trick:
+
+        d_max ≈ (1 / β) · log Σ_{i < j} exp(β · d_ij)
+
+    For large β this converges to the true ``max d_ij``; for finite β
+    the gradient stays continuous everywhere. Default β = 5 is a
+    practical compromise between sharpness and gradient smoothness.
+    The diagonal is pushed far below the argument range so self-pairs
+    don't leak into the LSE.
     """
     n_atom = coords.shape[-2]
     mask = _resolve_atom_mask(feats, n_atom, coords.device)
@@ -593,8 +599,14 @@ CV_REGISTRY["max_diameter"] = max_diameter_cv
 # ═══════════════════════════════════════════════════════════════════════
 
 def _sphere_points(n: int, device, dtype) -> torch.Tensor:
-    """Fibonacci sphere points ``[n, 3]`` (unit sphere)."""
-    gold = (1.0 + torch.sqrt(torch.tensor(5.0))) / 2.0
+    """Fibonacci sphere points ``[n, 3]`` (unit sphere).
+
+    ``gold`` is a Python float so the expression ``i / gold`` stays on
+    the same device as ``i`` (tensor-Python scalar division preserves
+    device; tensor-tensor division between devices would error).
+    """
+    import math as _math
+    gold = (1.0 + _math.sqrt(5.0)) / 2.0  # Python float, device-free
     i = torch.arange(n, device=device, dtype=dtype) + 0.5
     phi = 2.0 * torch.pi * (i / gold) % (2 * torch.pi)
     z = 1.0 - 2.0 * i / n

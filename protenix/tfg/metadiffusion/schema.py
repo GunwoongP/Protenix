@@ -108,7 +108,8 @@ def _warn_unsupported_fields(
             _WARNED_ONCE.add(key)
             logger.warning(
                 "[metadiffusion] %s (item %d) uses '%s' — accepted by "
-                "the parser but NOT applied in Phase 1. Your tuning here "
+                "the parser but NOT yet applied (deferred Phase D). Your "
+                "tuning here "
                 "will have no effect.",
                 term_name, item_idx, f,
             )
@@ -184,6 +185,18 @@ def parse_metadiffusion_block(
             continue
 
         # Mode items — one of {steer, opt, explore, saxs, chemical_shift}.
+        # Validate the body dict up-front (Copilot #12). A common user
+        # error is `- steer:` with no value, which yields `body = None`
+        # and later crashes with a cryptic AttributeError / TypeError
+        # deep inside `_warn_unsupported_fields` or `.get()`.
+        for _mk in ("steer", "opt", "explore"):
+            if _mk in item and not isinstance(item[_mk], dict):
+                raise TypeError(
+                    f"metadiffusion[{i}].{_mk} must be a mapping, got "
+                    f"{type(item[_mk]).__name__}: {item[_mk]!r}. "
+                    f"Did you forget the body?"
+                )
+
         if "steer" in item:
             body = item["steer"]
             name = f"SteeringPotential__{steer_i}"
@@ -253,7 +266,8 @@ def parse_metadiffusion_block(
             mode = next(k for k in _UNSUPPORTED_KEYS if k in item)
             raise NotImplementedError(
                 f"metadiffusion[{i}] mode '{mode}' is not supported yet "
-                f"(Phase 1 covers steer + opt only)."
+                f"(current support: steer / opt / explore. "
+                f"saxs / chemical_shift deferred — need experimental data.)"
             )
         else:
             raise KeyError(
@@ -482,8 +496,14 @@ def build_metadiffusion_features(
         if cv_name in {"drmsd", "d_tm", "tm", "rmsd", "native_contacts", "Q"}:
             ref_path = body.get("reference_structure")
             if ref_path is None:
+                # Derive the actual mode label so the message doesn't
+                # misreport an `explore` item as `opt` (Copilot #13).
+                mode_label = next(
+                    (k for k in ("steer", "opt", "explore") if k in item),
+                    "?",
+                )
                 raise KeyError(
-                    f"metadiffusion[{i}].{'steer' if 'steer' in item else 'opt'}: "
+                    f"metadiffusion[{i}].{mode_label}: "
                     f"CV '{cv_name}' requires 'reference_structure'."
                 )
             # Reference chain filter: use `groups` or, if only region1 is
@@ -512,10 +532,58 @@ def build_metadiffusion_features(
         # ── 4. Silently-ignored Boltz advanced fields → WARN ──
         _warn_unsupported_fields(i, term_name, body)
 
+        # ── 4. Gradient modifiers (Phase D) ──
+        # Boltz-compatible `scaling` / `projection` / `modifier_order`
+        # entries. Each scaler/projector is itself a CV spec with an
+        # optional per-modifier atom selection — we resolve those the
+        # same way we resolve the primary CV's masks.
+        from protenix.tfg.metadiffusion.gradient_mods import (
+            parse_scaling, parse_projection,
+        )
+
+        def _resolve_mod_cv_kwargs(mod_entry: dict) -> dict:
+            """Build CV kwargs for a scaling/projection entry."""
+            mod_kwargs: dict[str, Any] = {}
+            mod_regions = [mod_entry.get(f"region{i}") for i in (1, 2, 3, 4)]
+            mod_regions = [r for r in mod_regions if r]
+            mod_groups = mod_entry.get("groups")
+            if mod_regions:
+                masks = []
+                for r in mod_regions:
+                    m_np = _parse_region_spec(r, atom_array)
+                    masks.append(torch.from_numpy(m_np.astype(bool)))
+                mod_kwargs["atom_selection_mask"] = masks[0]
+                if len(masks) >= 2:
+                    mod_kwargs.setdefault("chain1_mask", masks[0])
+                    mod_kwargs.setdefault("chain2_mask", masks[1])
+                    mod_kwargs.setdefault("mask1", masks[0])
+                    mod_kwargs.setdefault("mask2", masks[1])
+            elif mod_groups:
+                m_np = _query_ca_mask_for_chains(atom_array, mod_groups)
+                mod_kwargs["atom_selection_mask"] = torch.from_numpy(m_np.astype(bool))
+            # Reference structure for rmsd/drmsd/etc. inside a scaler.
+            ref_path = mod_entry.get("reference_structure")
+            if ref_path:
+                refs = _load_reference_ca(ref_path, mod_groups)
+                mod_kwargs["reference_coords"] = refs
+                sel = mod_kwargs.get("atom_selection_mask")
+                if sel is not None:
+                    mod_kwargs["reference_mask"] = sel
+            return mod_kwargs
+
+        scalers = parse_scaling(body, _resolve_mod_cv_kwargs)
+        projectors = parse_projection(body, _resolve_mod_cv_kwargs)
+        modifier_order = body.get("modifier_order") or ["scaling", "projection"]
+
         terms_info.append({
             "term": term_name,
             "cv": cv_name,
             "cv_kwargs": cv_kwargs,
+            "mods": {
+                "scaling": scalers,
+                "projection": projectors,
+                "modifier_order": modifier_order,
+            },
         })
 
     out: dict[str, Any] = {"metadiffusion_terms": terms_info}
@@ -525,6 +593,8 @@ def build_metadiffusion_features(
     for t in terms_info:
         out[f"metadiffusion_cv_name__{t['term']}"] = t["cv"]
         out[f"metadiffusion_cv_kwargs__{t['term']}"] = t["cv_kwargs"]
+        if t.get("mods"):
+            out[f"metadiffusion_mods__{t['term']}"] = t["mods"]
     # Legacy single-term convenience: unchanged for backward compat.
     if len(terms_info) == 1:
         out["metadiffusion_cv_name"] = terms_info[0]["cv"]

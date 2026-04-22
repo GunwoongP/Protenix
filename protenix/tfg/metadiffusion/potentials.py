@@ -43,6 +43,11 @@ import torch
 
 from protenix.tfg.potentials import Potential, register
 from protenix.tfg.metadiffusion.cv import get_cv
+from protenix.tfg.metadiffusion.gradient_mods import (
+    ScalingConfig,
+    ProjectionConfig,
+    apply_modifiers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +163,40 @@ def _invoke_cv(
     """
     value, grad = cv_function(coords, feats, **cv_kwargs)
     return value, grad
+
+
+def _apply_grad_mods(
+    grad: Optional[torch.Tensor],
+    coords: torch.Tensor,
+    feats: dict[str, Any],
+    params: dict[str, Any],
+) -> Optional[torch.Tensor]:
+    """Stack scaling + projection on a raw potential gradient.
+
+    Reads pre-built ``ScalingConfig`` / ``ProjectionConfig`` lists from
+    term-specific feats (stashed by ``schema.build_metadiffusion_features``
+    under the ``metadiffusion_mods__<term>`` key). Silently no-op when
+    neither is configured.
+    """
+    if grad is None:
+        return grad
+    term_name = params.get("_term_name")
+    if not term_name:
+        return grad
+    mods_key = f"metadiffusion_mods__{term_name}"
+    mods = feats.get(mods_key)
+    if not mods:
+        return grad
+    scalers = mods.get("scaling") or []
+    projectors = mods.get("projection") or []
+    order = mods.get("modifier_order") or ["scaling", "projection"]
+    if not scalers and not projectors:
+        return grad
+    return apply_modifiers(
+        grad, coords, feats,
+        progress=_time_progress(params),
+        scalers=scalers, projectors=projectors, order=order,
+    )
 
 
 def _resolve_cv_spec(
@@ -343,6 +382,9 @@ class SteeringPotential(Potential):
                 "grad_norm": g_norm,
             })
 
+        grad = _apply_grad_mods(grad, coords, feats, params)
+
+
         if need_grad:
             return energy, grad
         return energy
@@ -489,23 +531,46 @@ class MetadynamicsPotential(Potential):
         bias_factor = float(params.get("bias_factor", 10.0))
         kT = float(params.get("kT", 2.5))
 
+        ensemble = bool(params.get("ensemble", False))
+
         cv_value, cv_grad = _invoke_cv(cv_function, coords, feats, cv_kwargs)
 
         # Deposit hill every `hill_interval` engine calls.
+        # Hill center is always the batch-mean CV (hills are a
+        # shared-state object; one hill per step covers the ensemble).
         if self._call_counter % hill_interval == 0:
-            cv_mean = float(cv_value.float().mean().item())
+            cv_for_hill = float(cv_value.float().mean().item())
             if well_tempered:
-                h_i = self._well_tempered_height(hill_h0, cv_mean, kT, bias_factor)
+                h_i = self._well_tempered_height(hill_h0, cv_for_hill, kT, bias_factor)
             else:
                 h_i = hill_h0
             max_hills = int(params.get("max_hills", 1000))
             self.deposit_hill(
-                cv_mean, self._call_counter, h_i, hill_sigma,
+                cv_for_hill, self._call_counter, h_i, hill_sigma,
                 max_hills=max_hills,
             )
 
+        # Ensemble mode (Copilot #14): SteeringPotential-style semantics
+        # so the API is consistent across modes.
+        #   - ensemble=False (default): V / dV evaluated on per-sample CV
+        #     → each sample feels an independent push away from the hill
+        #       centers. Natural for free-energy estimation.
+        #   - ensemble=True: V evaluated on the batch-mean CV, grad split
+        #     equally over the batch (factor 1/N) so every sample gets
+        #     the same coherent update. Matches SteeringPotential.
+        if ensemble and cv_value.ndim >= 1:
+            n = max(cv_value.numel(), 1)
+            cv_for_loss = cv_value.mean()
+            cv_grad = cv_grad / float(n)
+        else:
+            cv_for_loss = cv_value
+
         # Compute bias energy + dV/dCV.
-        V, dV_dCV = self._hill_bias(cv_value, hill_sigma)
+        V, dV_dCV = self._hill_bias(cv_for_loss, hill_sigma)
+
+        if ensemble and cv_value.ndim >= 1:
+            V = V.expand(cv_value.shape)
+            dV_dCV = dV_dCV.expand(cv_value.shape)
 
         grad = None
         if need_grad:
@@ -527,6 +592,9 @@ class MetadynamicsPotential(Potential):
                 "hills": len(self.hills),
                 "V_mean": float(V.float().mean().item()),
             })
+
+        grad = _apply_grad_mods(grad, coords, feats, params)
+
 
         if need_grad:
             return V, grad
@@ -621,6 +689,9 @@ class OptPotential(Potential):
                 "strength": strength, "energy_mean": e_mean,
                 "grad_norm": g_norm_v,
             })
+
+        grad = _apply_grad_mods(grad, coords, feats, params)
+
 
         if need_grad:
             return energy, grad
