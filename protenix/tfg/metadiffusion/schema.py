@@ -79,8 +79,10 @@ _UNSUPPORTED_KEYS = {"saxs", "chemical_shift"}
 # act on. Warn the user once so they know the setting is silently
 # dropped rather than wondering why tuning has no effect.
 _ADVANCED_IGNORED_FIELDS = {
-    # gradient post-processing
-    "scaling", "projection", "modifier_order", "bias_tempering",
+    # gradient post-processing — bias_tempering is the only one here
+    # that is still not wired in (scaling / projection / modifier_order
+    # landed in Phase D and are honoured by the potentials).
+    "bias_tempering",
     # CV auto-tuning
     "target_from_saxs", "auto_rg_scale", "gaussian_noise_scale",
     # Boltz-specific selection hints that our parser does not honour
