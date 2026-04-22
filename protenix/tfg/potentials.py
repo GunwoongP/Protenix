@@ -1524,12 +1524,17 @@ class TemplateReferencePotential(Potential):
             else:
                 ref_expanded = ref_tok.expand_as(token_coords)
             if rigid:
-                ref_aligned = weighted_rigid_align(
-                    x=ref_expanded,
-                    x_target=token_coords,
-                    atom_weight=mask_tok,
-                    stop_gradient=True,
-                )
+                # `weighted_rigid_align` calls `torch.linalg.svd`, which does
+                # not support fp16/bf16 and errors under AMP. Disable autocast
+                # and run the alignment in fp32, then cast back.
+                with torch.amp.autocast(coords.device.type, enabled=False):
+                    ref_aligned = weighted_rigid_align(
+                        x=ref_expanded.float(),
+                        x_target=token_coords.float(),
+                        atom_weight=mask_tok.float(),
+                        stop_gradient=True,
+                    )
+                ref_aligned = ref_aligned.to(coords.dtype)
             else:
                 ref_aligned = ref_expanded
 

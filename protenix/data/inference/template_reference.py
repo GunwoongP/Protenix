@@ -370,13 +370,22 @@ def build_trunk_template_features(
         DENSE_ATOM,
         PROTEIN_COMMON_ONE_TO_THREE,
         PROTEIN_TYPES_ONE_LETTER,
+        STD_RESIDUES_WITH_GAP,
     )
 
-    # Restype index convention: PROTEIN_TYPES_ONE_LETTER[i] = 1-letter code for aatype=i.
-    # UNK and non-standard residues → aatype=len(PROTEIN_TYPES_ONE_LETTER)=20 (UNK slot).
+    # Restype index convention (Protenix / AF3 SI Table 13):
+    #   0..19 : standard amino acids
+    #   20    : UNK (residue exists but type unknown / non-standard)
+    #   21..30: RNA/DNA
+    #   31    : GAP (no residue at this position)
+    # The TemplateEmbedder does `F.one_hot(aatype, num_classes=32)` without
+    # masking, so UNK and GAP produce distinct embedding signals. We must use
+    # GAP as the default for unaligned tokens, matching Protenix's existing
+    # template pipeline (see `data/template/template_utils.py:181`).
     _ONE_TO_IDX = {c: i for i, c in enumerate(PROTEIN_TYPES_ONE_LETTER)}
     _THREE_TO_ONE = {v: k for k, v in PROTEIN_COMMON_ONE_TO_THREE.items()}
     UNK_IDX = len(PROTEIN_TYPES_ONE_LETTER)  # 20
+    GAP_IDX = STD_RESIDUES_WITH_GAP["-"]  # 31
 
     # Centre atom → query residue (chain, res_id, res3name) per token.
     centre_atom_idx = np.asarray(
@@ -410,7 +419,7 @@ def build_trunk_template_features(
     # Allocate output arrays (Protenix DENSE_ATOM max width).
     N_dense = max(len(v) for v in DENSE_ATOM.values())
     n_tmpl = len(templates)
-    aatype = np.full((n_tmpl, n_token), UNK_IDX, dtype=np.int64)
+    aatype = np.full((n_tmpl, n_token), GAP_IDX, dtype=np.int64)
     atom_positions = np.zeros((n_tmpl, n_token, N_dense, 3), dtype=np.float32)
     atom_mask = np.zeros((n_tmpl, n_token, N_dense), dtype=np.float32)
 
@@ -444,14 +453,13 @@ def build_trunk_template_features(
             t_res = q_res - offsets.get(q_chain, 0)
 
             # Boltz convention: template aatype / atom list follow the
-            # TEMPLATE residue identity, not the query's. Fall back to the
-            # query residue only when the template has no residue at the
-            # aligned position (leaves mask=0 for that token either way).
+            # TEMPLATE residue identity. When the template is missing the
+            # aligned residue entirely, we leave `aatype` at GAP and
+            # `atom_mask` at 0 so the embedder sees no template signal
+            # there — no query fallback (it would inject a wrong residue
+            # type even though atoms are masked out).
             t_res3 = res_name_by_pos.get((t_chain, t_res))
             if t_res3 is None or t_res3 not in ATOM14:
-                t_res3 = q_res3 if q_res3 in ATOM14 else None
-            if t_res3 is None:
-                # Non-standard residue on both sides; cannot fill ATOM14 slots.
                 continue
             one_letter = _THREE_TO_ONE.get(t_res3)
             if one_letter is None or one_letter not in _ONE_TO_IDX:
