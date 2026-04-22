@@ -302,18 +302,28 @@ def pair_drmsd_cv(
     So the returned value has shape ``[B]``, with each entry telling
     sample k how different it is from the other B-1 samples on average.
 
-    Why per-sample matters
-    ----------------------
-    When used as an OptPotential target (``direction = -1`` pushes the
-    CV up), each sample receives an *independent* gradient that pushes
-    it AWAY from the mean of the others. That is what drives diversity.
-    A scalar (batch-mean) CV would emit identical gradients to every
-    sample and fail to break symmetry — which is exactly what we saw in
-    our first implementation.
-
-    Autograd handles the cross-sample coupling implicitly: because
+    Gradient semantics
+    ------------------
+    The returned ``grad`` has shape ``[B, N, 3]`` and is
+    ``d(Σ_k CV_k) / dcoords`` — the sum-accumulated gradient. Because
     pair(i, j) depends on both coords[i] and coords[j], each CV_k's
-    gradient lands on *every* sample coord (not just coords[k]).
+    contribution lands on every sample's coord. When downstream
+    multiplies by a per-sample ``dE/dCV_k`` (shape ``[B]``) and reshapes
+    for broadcast, the combined computation is:
+
+        grad_final[k] = (dE/dCV_k) · Σ_j dCV_j/dcoords[k]
+
+    That equals the true chain-rule result ``Σ_j (dE/dCV_j · dCV_j/dcoords[k])``
+    only when ``dE/dCV`` is uniform across samples — i.e. with
+    :class:`OptPotential` (constant ``direction * strength``) or
+    :class:`SteeringPotential` in ``ensemble=True`` mode.
+
+    With :class:`SteeringPotential` in per-sample mode (each sample has
+    its own CV value chasing the same scalar target, so ``dE/dCV_k``
+    varies by k), the gradient becomes an approximation. That is
+    acceptable for diversity-style steering where the ranking of
+    per-sample pulls is what matters; for exact per-sample JVP use
+    OptPotential or ensemble Steering instead.
     """
     if coords.ndim < 3 or coords.shape[0] < 2:
         # No pair to compute (single sample or missing batch dim).

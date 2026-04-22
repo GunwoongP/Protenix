@@ -493,7 +493,10 @@ def parse_tfg_config(guidance_cfg: Mapping[str, Any] | None) -> TFGConfig:
     # fine (unlike the legacy `terms:` mapping which is keyed by name).
     md_list = cfg.get("metadiffusion")
     if md_list:
-        # Lazy import triggers @register for SteeringPotential / OptPotential.
+        # Note: potential classes (SteeringPotential / OptPotential /
+        # MetadynamicsPotential) are registered at package import time
+        # via `protenix.tfg.__init__` importing `protenix.tfg.metadiffusion`.
+        # The import below only pulls the schema helper.
         from protenix.tfg.metadiffusion.schema import parse_metadiffusion_block
         md_terms, md_globals = parse_metadiffusion_block(md_list)
         for term_name, body in md_terms.items():
