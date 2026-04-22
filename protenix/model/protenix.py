@@ -331,13 +331,22 @@ class Protenix(nn.Module):
                 ),
             }
         )
-        _configs.update(
-            {
-                "guidance_configs": self.configs.sample_diffusion.to_dict().get(
-                    "guidance"
-                )
-            }
-        )
+        guidance_cfg = self.configs.sample_diffusion.to_dict().get("guidance")
+
+        # MetaDiffusion: when the input JSON carried a `metadiffusion:`
+        # list, the dataloader stashed it as `_metadiffusion_list` in
+        # the feature dict. Merge it into `guidance_configs` so the
+        # TFG engine instantiates Steering / Opt terms. Works for both
+        # Protenix v1 and v2 — identical TFG path.
+        ifeats = kwargs.get("input_feature_dict", {})
+        md_list = ifeats.get("_metadiffusion_list")
+        if md_list:
+            guidance_cfg = dict(guidance_cfg) if guidance_cfg else {}
+            guidance_cfg["metadiffusion"] = md_list
+            # Auto-enable guidance when the user supplied metadiffusion.
+            guidance_cfg.setdefault("enable", True)
+
+        _configs.update({"guidance_configs": guidance_cfg})
         return autocasting_disable_decorator(self.configs.skip_amp.sample_diffusion)(
             sample_diffusion
         )(**_configs, **kwargs)

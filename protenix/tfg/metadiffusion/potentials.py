@@ -56,6 +56,13 @@ logger = logging.getLogger(__name__)
 # running trace in `_diagnostics_history` attribute if opted into.
 _DEBUG_ENV = os.environ.get("METADIFFUSION_DEBUG", "").lower() in {"1", "true", "yes"}
 
+# When the env switch is on we raise this module's logger to INFO so the
+# per-eval summaries actually reach the console regardless of the root
+# logger's default level (typically WARNING). Per-term `debug=True`
+# alone does NOT flip this — that's a per-call flag for unit testing.
+if _DEBUG_ENV:
+    logger.setLevel(logging.INFO)
+
 
 def _debug_enabled(params: dict[str, Any]) -> bool:
     """Union of env switch, per-term `debug=True`, and DEBUG logger level."""
@@ -64,6 +71,14 @@ def _debug_enabled(params: dict[str, Any]) -> bool:
     if _DEBUG_ENV:
         return True
     return logger.isEnabledFor(logging.DEBUG)
+
+
+def _debug_log(msg: str, *args) -> None:
+    """Emit at INFO when env switch is on, else at DEBUG (caller silent)."""
+    if _DEBUG_ENV:
+        logger.info(msg, *args)
+    else:
+        logger.debug(msg, *args)
 
 
 def _record_diag(pot: "Potential", entry: dict[str, Any]) -> None:
@@ -226,7 +241,7 @@ class SteeringPotential(Potential):
         progress = _time_progress(params)
         if not _window_active(params):
             if _debug_enabled(params):
-                logger.debug(
+                _debug_log(
                     "[metadiff/Steering] skip (progress=%.3f outside "
                     "warmup=%.2f..cutoff=%.2f)",
                     progress, float(params.get("warmup", 0.0)),
@@ -284,7 +299,7 @@ class SteeringPotential(Potential):
                     float(grad.norm(dim=-1).mean().item())
                     if grad is not None else float("nan")
                 )
-            logger.debug(
+            _debug_log(
                 "[metadiff/Steering/%s] t=%.3f  CV=%.4f (min=%.4f, max=%.4f) "
                 "target=%.4f  mode=%s  k/A=%.3g  E_mean=%.4g  |grad|=%.4g",
                 cv_name, progress, cv_mean, cv_min, cv_max,
@@ -300,6 +315,182 @@ class SteeringPotential(Potential):
         if need_grad:
             return energy, grad
         return energy
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MetadynamicsPotential — explore mode (Gaussian hills)
+# ═══════════════════════════════════════════════════════════════════════
+
+@register
+class MetadynamicsPotential(Potential):
+    """Enhanced sampling via Gaussian hill deposition on a CV.
+
+        V(s) = Σ_i  h_i · exp(-(s - s_i)^2 / (2 σ^2))
+
+    Each call to ``_eval`` increments an internal counter; every
+    ``hill_interval`` calls we deposit a new hill at the current CV
+    value. The accumulated bias then drives the sampler AWAY from
+    previously visited CV regions, which is the metadynamics trick.
+
+    Well-tempered variant (enabled by ``well_tempered=True``):
+
+        h_i = h_0 · exp(-V(s_{i-1}) / (kT · (γ - 1)))
+
+    so the bias deposition rate decays as the surface fills up and the
+    free-energy estimate converges.
+
+    Params (resolved at ``_eval``)
+    ------------------------------
+    hill_height   : float, default 0.5  (base Gaussian height)
+    hill_sigma    : float, default 2.0  (Gaussian width in CV units)
+    hill_interval : int,   default 5    (deposit every N engine calls)
+    well_tempered : bool,  default False
+    bias_factor   : float, default 10.0 (γ, for well-tempered)
+    kT            : float, default 2.5  (thermal scale; CASP-tuned)
+    max_hills     : int,   default 1000 (cap stored hills, FIFO prune)
+    warmup, cutoff, ensemble : same semantics as SteeringPotential.
+    """
+
+    def __init__(self, default_params: Optional[dict[str, Any]] = None):
+        defaults: dict[str, Any] = {
+            "hill_height": 0.5, "hill_sigma": 2.0, "hill_interval": 5,
+            "well_tempered": False, "bias_factor": 10.0, "kT": 2.5,
+            "max_hills": 1000,
+            "warmup": 0.0, "cutoff": 0.75, "ensemble": False,
+        }
+        if default_params:
+            defaults.update(default_params)
+        super().__init__(defaults)
+        self.hills: list[dict[str, float]] = []
+        self._call_counter = 0
+
+    def reset_hills(self) -> None:
+        """Clear history between independent runs."""
+        self.hills.clear()
+        self._call_counter = 0
+
+    def _hill_bias(
+        self, cv: torch.Tensor, sigma: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sum of Gaussians: V(cv) = Σ h_i exp(-(cv - s_i)^2 / 2σ^2).
+
+        Returns ``(V, dV/dcv)`` both with ``cv``'s shape. If no hills
+        yet, returns zeros.
+        """
+        if not self.hills:
+            return torch.zeros_like(cv), torch.zeros_like(cv)
+        V = torch.zeros_like(cv)
+        dV_dCV = torch.zeros_like(cv)
+        s2_inv = 1.0 / (sigma * sigma + 1e-12)
+        for h in self.hills:
+            s_i = float(h["cv_center"])
+            A = float(h["height"])
+            delta = cv - s_i
+            kernel = torch.exp(-0.5 * delta * delta * s2_inv)
+            V = V + A * kernel
+            dV_dCV = dV_dCV + (-A * delta * s2_inv) * kernel
+        return V, dV_dCV
+
+    def _well_tempered_height(
+        self, h_0: float, cv_scalar: float, kT: float, bias_factor: float
+    ) -> float:
+        """h_i = h_0 · exp(-V(cv) / (kT · (γ-1)))."""
+        if bias_factor <= 1.0:
+            return h_0
+        dT = kT * (bias_factor - 1.0)
+        # Evaluate V(cv) with current hills as pure-Python scalars.
+        import math as _math
+        V_here = 0.0
+        for h in self.hills:
+            delta = cv_scalar - float(h["cv_center"])
+            V_here += float(h["height"]) * _math.exp(
+                -0.5 * delta * delta / (float(h["sigma"]) ** 2 + 1e-12)
+            )
+        return h_0 * _math.exp(-V_here / (dT + 1e-8))
+
+    def deposit_hill(
+        self, cv_value_scalar: float, step_idx: int,
+        height: float, sigma: float,
+    ) -> None:
+        """Add one hill, prune FIFO to `max_hills`."""
+        self.hills.append({
+            "cv_center": float(cv_value_scalar),
+            "height": float(height),
+            "sigma": float(sigma),
+            "step": int(step_idx),
+        })
+        max_h = int(self._default_params.get("max_hills", 1000))
+        if len(self.hills) > max_h:
+            del self.hills[: len(self.hills) - max_h]
+
+    def _eval(
+        self,
+        coords: torch.Tensor,
+        feats: dict[str, Any],
+        params: dict[str, Any],
+        need_grad: bool,
+    ):
+        self._call_counter += 1
+
+        if not _window_active(params):
+            if _debug_enabled(params):
+                _debug_log(
+                    "[metadiff/Metad] skip (t=%.3f outside window)",
+                    _time_progress(params),
+                )
+            return _zero_energy_and_grad(coords) if need_grad else _zero_energy(coords)
+
+        cv_name = feats.get("metadiffusion_cv_name", params.get("cv", None))
+        cv_kwargs = feats.get("metadiffusion_cv_kwargs", {})
+        if cv_name is None:
+            return _zero_energy_and_grad(coords) if need_grad else _zero_energy(coords)
+        cv_function = get_cv(cv_name)
+
+        hill_sigma = float(params.get("hill_sigma", 2.0))
+        hill_h0 = float(params.get("hill_height", 0.5))
+        hill_interval = max(1, int(params.get("hill_interval", 5)))
+        well_tempered = bool(params.get("well_tempered", False))
+        bias_factor = float(params.get("bias_factor", 10.0))
+        kT = float(params.get("kT", 2.5))
+
+        cv_value, cv_grad = _invoke_cv(cv_function, coords, feats, cv_kwargs)
+
+        # Deposit hill every `hill_interval` engine calls.
+        if self._call_counter % hill_interval == 0:
+            cv_mean = float(cv_value.float().mean().item())
+            if well_tempered:
+                h_i = self._well_tempered_height(hill_h0, cv_mean, kT, bias_factor)
+            else:
+                h_i = hill_h0
+            self.deposit_hill(cv_mean, self._call_counter, h_i, hill_sigma)
+
+        # Compute bias energy + dV/dCV.
+        V, dV_dCV = self._hill_bias(cv_value, hill_sigma)
+
+        grad = None
+        if need_grad:
+            broadcast_shape = dV_dCV.shape + (1, 1)
+            grad = dV_dCV.reshape(broadcast_shape) * cv_grad
+
+        if _debug_enabled(params):
+            _debug_log(
+                "[metadiff/Metad/%s] t=%.3f  CV=%.4f  hills=%d  V_mean=%.4g",
+                cv_name, _time_progress(params),
+                float(cv_value.float().mean().item()),
+                len(self.hills),
+                float(V.float().mean().item()),
+            )
+            _record_diag(self, {
+                "term": "Metadynamics", "cv": cv_name,
+                "progress": _time_progress(params),
+                "cv_mean": float(cv_value.float().mean().item()),
+                "hills": len(self.hills),
+                "V_mean": float(V.float().mean().item()),
+            })
+
+        if need_grad:
+            return V, grad
+        return V
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -378,7 +569,7 @@ class OptPotential(Potential):
                     float(grad.norm(dim=-1).mean().item())
                     if grad is not None else float("nan")
                 )
-            logger.debug(
+            _debug_log(
                 "[metadiff/Opt/%s] t=%.3f  CV=%.4f  direction=%+.1f  "
                 "strength=%.3g  E_mean=%.4g  |grad|=%.4g",
                 cv_name, _time_progress(params), cv_mean,

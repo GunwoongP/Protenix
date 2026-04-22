@@ -229,6 +229,24 @@ class InferenceDataset(Dataset):
             )
             features_dict.update(trunk_tmpl)
 
+        # MetaDiffusion: per-CV features (atom masks, reference coords) if
+        # the user supplied a `metadiffusion:` block in the input JSON.
+        # Same builder is used for both Protenix v1 and v2 — the TFG
+        # engine path is identical. The raw list is also stashed under
+        # `_metadiffusion_list` so downstream (sample_diffusion) can
+        # merge it into the guidance_configs for `parse_tfg_config`.
+        if single_sample_dict.get("metadiffusion"):
+            from protenix.tfg.metadiffusion.schema import (
+                build_metadiffusion_features,
+            )
+            md_feats = build_metadiffusion_features(
+                single_sample_dict["metadiffusion"], atom_array
+            )
+            features_dict.update(md_feats)
+            features_dict["_metadiffusion_list"] = single_sample_dict[
+                "metadiffusion"
+            ]
+
         # Transform to right data type
         feat = data_type_transform(feat_or_label_dict=features_dict)
 

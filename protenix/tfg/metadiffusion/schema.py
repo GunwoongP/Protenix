@@ -69,7 +69,47 @@ logger = logging.getLogger(__name__)
 # ───────────────────────────────────────────────────────────────────────
 
 _GLOBAL_KEYS = {"total_bias_clip", "noise_scale", "guidance_mode", "denoise_tempering"}
-_UNSUPPORTED_KEYS = {"explore", "saxs", "chemical_shift"}
+# Phase 1 shipped steer + opt. Phase 2 adds explore (metadynamics hills).
+# SAXS / chemical_shift still require experimental data and stay Phase 3.
+_UNSUPPORTED_KEYS = {"saxs", "chemical_shift"}
+
+# Boltz-native fields that our Phase-1 parser accepts but does not yet
+# act on. Warn the user once so they know the setting is silently
+# dropped rather than wondering why tuning has no effect.
+_ADVANCED_IGNORED_FIELDS = {
+    # gradient post-processing
+    "scaling", "projection", "modifier_order", "bias_tempering",
+    # CV auto-tuning
+    "target_from_saxs", "auto_rg_scale", "gaussian_noise_scale",
+    # Boltz-specific selection hints that our parser does not honour
+    "atom1", "atom2", "atom3", "atom4",
+    "rmsd_groups", "selection",
+    # SASA params beyond what our simple CV honours (probe_radius is
+    # accepted; sasa_method (LCPO vs Shrake–Rupley) is not).
+    "sasa_method",
+}
+
+# Set of seen warnings keyed by (term, field) so we warn only once per
+# (term, field) per process lifetime.
+_WARNED_ONCE: set[tuple[str, str]] = set()
+
+
+def _warn_unsupported_fields(
+    item_idx: int, term_name: str, body: dict[str, Any]
+) -> None:
+    """Emit a one-time WARN per advanced/ignored Boltz field."""
+    for f in _ADVANCED_IGNORED_FIELDS:
+        if f in body:
+            key = (term_name, f)
+            if key in _WARNED_ONCE:
+                continue
+            _WARNED_ONCE.add(key)
+            logger.warning(
+                "[metadiffusion] %s (item %d) uses '%s' — accepted by "
+                "the parser but NOT applied in Phase 1. Your tuning here "
+                "will have no effect.",
+                term_name, item_idx, f,
+            )
 
 
 def _as_term_body(mode_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -118,6 +158,7 @@ def parse_metadiffusion_block(
 
     steer_i = 0
     opt_i = 0
+    explore_i = 0
 
     for i, item in enumerate(metadiffusion_list):
         if not isinstance(item, dict):
@@ -136,6 +177,7 @@ def parse_metadiffusion_block(
             body = item["steer"]
             name = f"SteeringPotential__{steer_i}"
             steer_i += 1
+            _warn_unsupported_fields(i, name, body)
             term_cfg: dict[str, Any] = {
                 "interval": int(body.get("guidance_interval", 1)),
                 "weight": float(body.get("weight", 1.0)),
@@ -145,10 +187,37 @@ def parse_metadiffusion_block(
             # `warmup`, `cutoff`, `ensemble` directly; pass through.
             terms[name] = term_cfg
 
+        elif "explore" in item:
+            # Metadynamics hill-deposition mode. Phase 2.
+            body = item["explore"]
+            # Only "hills" (and its default alias) explore_type is handled
+            # here; "repulsion" is not yet implemented.
+            etype = str(body.get("type", body.get("explore_type", "hills"))).lower()
+            if etype == "repulsion":
+                raise NotImplementedError(
+                    f"metadiffusion[{i}].explore type 'repulsion' is not "
+                    f"supported yet (Phase 2 handles 'hills' / well-tempered)."
+                )
+            if "explore_i" not in locals(): explore_i = 0
+            name = f"MetadynamicsPotential__{explore_i}"
+            explore_i += 1
+            _warn_unsupported_fields(i, name, body)
+            term_cfg = {
+                "interval": int(body.get("guidance_interval", 1)),
+                "weight": float(body.get("weight", 1.0)),
+            }
+            term_cfg.update(_as_term_body(body))
+            # Normalise Boltz's "type" field → we keep the engine-facing
+            # name plain (MetadynamicsPotential handles hills only for now).
+            term_cfg.pop("type", None)
+            term_cfg.pop("explore_type", None)
+            terms[name] = term_cfg
+
         elif "opt" in item:
             body = item["opt"]
             name = f"OptPotential__{opt_i}"
             opt_i += 1
+            _warn_unsupported_fields(i, name, body)
             # "target" in opt is "min" | "max" → translate to direction.
             target = body.get("target", "min")
             if isinstance(target, str):
@@ -198,6 +267,66 @@ def _chain_mask(atom_array, chain_ids: Iterable[str]) -> np.ndarray:
 def _ca_mask(atom_array) -> np.ndarray:
     """CA atoms only (standard residues)."""
     return atom_array.atom_name.astype(str) == "CA"
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Region spec parser — Boltz-compatible
+# ───────────────────────────────────────────────────────────────────────
+
+def _parse_region_spec(spec: str, atom_array) -> np.ndarray:
+    """Resolve a Boltz-style region spec to a ``[N_atom]`` bool mask.
+
+    Supported grammar (matches
+    ``boltz.model.potentials.factory._resolve_region_to_mask``)::
+
+        "A"              whole chain A (all atoms)
+        "A:1-50"         chain A residues 1..50 (all atoms)
+        "A:5"            chain A residue 5 (all atoms)
+        "A::CA"          chain A CA atoms only (whole chain)
+        "A:1-50:CA"      chain A residues 1..50, CA atoms only
+        "A:5:CA"         chain A residue 5 CA atom
+
+    Residue IDs match ``atom_array.res_id``. Atom names match
+    ``atom_array.atom_name``. Missing pieces are treated as wildcards.
+    """
+    n = len(atom_array)
+    mask = np.zeros(n, dtype=bool)
+    parts = [p.strip() for p in str(spec).split(":")]
+    if not parts or not parts[0]:
+        return mask
+
+    chain_id = parts[0]
+    chain_sel = atom_array.chain_id.astype(str) == chain_id
+    if not chain_sel.any():
+        logger.warning(
+            "[metadiffusion/region] chain '%s' not in atom_array. "
+            "Empty mask.", chain_id,
+        )
+        return mask
+
+    # Residue filter (parts[1] if present and non-empty).
+    if len(parts) >= 2 and parts[1]:
+        rs = parts[1]
+        if "-" in rs:
+            lo, hi = rs.split("-", 1)
+            res_sel = (atom_array.res_id >= int(lo)) & (atom_array.res_id <= int(hi))
+        else:
+            res_sel = atom_array.res_id == int(rs)
+    else:
+        res_sel = np.ones(n, dtype=bool)
+
+    # Atom-name filter (parts[2] if present and non-empty).
+    if len(parts) >= 3 and parts[2]:
+        atom_sel = atom_array.atom_name.astype(str) == parts[2]
+    else:
+        atom_sel = np.ones(n, dtype=bool)
+
+    mask = chain_sel & res_sel & atom_sel
+    if not mask.any():
+        logger.warning(
+            "[metadiffusion/region] spec '%s' matched 0 atoms.", spec
+        )
+    return mask
 
 
 def _load_reference_ca(path: str, chain_filter: Iterable[str] | None = None) -> torch.Tensor:
@@ -267,6 +396,7 @@ def build_metadiffusion_features(
     terms_info: list[dict[str, Any]] = []
     steer_i = 0
     opt_i = 0
+    explore_i = 0
 
     for i, item in enumerate(metadiffusion_list):
         if not isinstance(item, dict):
@@ -278,44 +408,90 @@ def build_metadiffusion_features(
             body = item["steer"]; term_name = f"SteeringPotential__{steer_i}"; steer_i += 1
         elif "opt" in item:
             body = item["opt"]; term_name = f"OptPotential__{opt_i}"; opt_i += 1
+        elif "explore" in item:
+            body = item["explore"]; term_name = f"MetadynamicsPotential__{explore_i}"; explore_i += 1
         else:
             continue
 
         cv_name = str(body.get("collective_variable") or body.get("cv"))
         cv_kwargs: dict[str, Any] = {}
 
-        # Atom selection mask (CV's main target atoms) from `groups`.
+        # ── 1. Atom selection: `region1..4` takes precedence over `groups` ──
+        regions = [body.get(f"region{i}") for i in (1, 2, 3, 4)]
+        regions = [r for r in regions if r]
         groups = body.get("groups")
-        if groups:
+
+        if regions:
+            # Build masks per region spec. Store on cv_kwargs as
+            # `region1_mask`..`region4_mask`. The first region doubles as
+            # the main `atom_selection_mask` (backwards compatible with
+            # single-group CVs like rg / sasa).
+            region_masks = []
+            for r_i, spec in enumerate(regions, start=1):
+                m_np = _parse_region_spec(spec, atom_array)
+                m_t = torch.from_numpy(m_np.astype(bool))
+                cv_kwargs[f"region{r_i}_mask"] = m_t
+                region_masks.append(m_t)
+            cv_kwargs["atom_selection_mask"] = region_masks[0]
+            # Convenience aliases that match the CV function kwarg names.
+            # Eg. `inter_chain_cv(chain1_mask, chain2_mask)` maps naturally.
+            if len(region_masks) >= 2:
+                cv_kwargs.setdefault("chain1_mask", region_masks[0])
+                cv_kwargs.setdefault("chain2_mask", region_masks[1])
+                cv_kwargs.setdefault("mask1", region_masks[0])
+                cv_kwargs.setdefault("mask2", region_masks[1])
+        elif groups:
+            # Chain-level atom selection (Cα only).
             sel_mask_np = _query_ca_mask_for_chains(atom_array, groups)
             sel_mask = torch.from_numpy(sel_mask_np.astype(bool))
             cv_kwargs["atom_selection_mask"] = sel_mask
+            # For 2-chain CVs (`inter_chain`, `distance`) unambiguously
+            # split the groups into two chain masks.
+            if len(groups) >= 2 and cv_name in {"inter_chain", "distance"}:
+                m1_np = _chain_mask(atom_array, [groups[0]])
+                m2_np = _chain_mask(atom_array, [groups[1]])
+                cv_kwargs["chain1_mask"] = torch.from_numpy(m1_np.astype(bool))
+                cv_kwargs["chain2_mask"] = torch.from_numpy(m2_np.astype(bool))
+                cv_kwargs["mask1"] = cv_kwargs["chain1_mask"]
+                cv_kwargs["mask2"] = cv_kwargs["chain2_mask"]
         else:
             sel_mask_np = _query_ca_mask_for_chains(atom_array, None)
             sel_mask = torch.from_numpy(sel_mask_np.astype(bool))
             cv_kwargs["atom_selection_mask"] = sel_mask
 
-        # Reference coordinates for CVs that need them (rmsd/tm/drmsd).
-        if cv_name in {"drmsd", "d_tm", "tm", "rmsd"}:
+        # ── 2. Reference coords (for rmsd / drmsd / d_tm / native_contacts) ──
+        if cv_name in {"drmsd", "d_tm", "tm", "rmsd", "native_contacts", "Q"}:
             ref_path = body.get("reference_structure")
             if ref_path is None:
                 raise KeyError(
                     f"metadiffusion[{i}].{'steer' if 'steer' in item else 'opt'}: "
                     f"CV '{cv_name}' requires 'reference_structure'."
                 )
-            ref_chains = groups  # reference subset follows query groups
+            # Reference chain filter: use `groups` or, if only region1 is
+            # given, infer chain ID from the region spec.
+            ref_chains = groups
+            if ref_chains is None and regions:
+                ref_chains = [str(regions[0]).split(":", 1)[0]]
             ref_coords = _load_reference_ca(ref_path, ref_chains)
             cv_kwargs["reference_coords"] = ref_coords
-            # For drmsd/d_tm the mask must count exactly reference_coords.
-            # The CV functions assert this; surface early if mismatched.
+            sel_mask = cv_kwargs["atom_selection_mask"]
             if int(sel_mask.sum().item()) != ref_coords.shape[0]:
                 logger.warning(
                     "[metadiffusion] term %s: query Cα count %d != "
                     "reference Cα count %d. CV will likely fail; check "
-                    "chain_mapping / reference_structure.",
+                    "groups / region / reference_structure.",
                     term_name, int(sel_mask.sum().item()), ref_coords.shape[0],
                 )
             cv_kwargs["reference_mask"] = sel_mask
+
+        # ── 3. CV-specific params (forward to CV function as kwargs) ──
+        for k in ("contact_cutoff", "beta", "probe_radius", "atom_radius",
+                  "n_quad", "chunk_size"):
+            if k in body:
+                cv_kwargs[k] = body[k]
+
+        # ── 4. Silently-ignored Boltz advanced fields → WARN ──
+        _warn_unsupported_fields(i, term_name, body)
 
         terms_info.append({
             "term": term_name,

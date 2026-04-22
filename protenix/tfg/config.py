@@ -30,7 +30,7 @@ What this file defines
 
 import math
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Optional
 
 import torch
 
@@ -406,6 +406,10 @@ class TFGConfig:
     terms: tuple[Term, ...]
     # Debug switch: log per-term energies at the last refinement step.
     log_last_step_energy: bool = False
+    # Metadiffusion global knobs (Boltz-compatible). ``total_bias_clip``
+    # caps per-atom gradient magnitude (Å) applied during refinement.
+    # None = no clipping.
+    total_bias_clip: Optional[float] = None
 
 
 def parse_tfg_config(guidance_cfg: Mapping[str, Any] | None) -> TFGConfig:
@@ -496,6 +500,13 @@ def parse_tfg_config(guidance_cfg: Mapping[str, Any] | None) -> TFGConfig:
     if enable and len(terms) == 0:
         raise ValueError("TFG is enabled but no terms are configured")
 
+    # Pull `total_bias_clip` out of either the metadiffusion globals or
+    # the top-level guidance config (both forms accepted).
+    md_globals = cfg.get("metadiffusion_globals") or {}
+    total_bias_clip = md_globals.get("total_bias_clip", cfg.get("total_bias_clip"))
+    if total_bias_clip is not None:
+        total_bias_clip = float(total_bias_clip)
+
     return TFGConfig(
         enable=enable,
         rho=rho,
@@ -508,4 +519,5 @@ def parse_tfg_config(guidance_cfg: Mapping[str, Any] | None) -> TFGConfig:
         projection_outer_steps=projection_outer_steps,
         terms=terms,
         log_last_step_energy=bool(cfg.get("log_last_step_energy", False)),
+        total_bias_clip=total_bias_clip,
     )

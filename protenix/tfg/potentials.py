@@ -1196,17 +1196,23 @@ class VinaStericPotential(Potential):
 
         # This term is inter-chain only. If there is a single chain, early-exit
         # to avoid constructing O(N^2) candidate pairs.
+        # NOTE: `_cache_and_return` takes a single tuple argument (the
+        # other 4 call sites below use `_cache_and_return(out)` where
+        # `out` is already a `(idx, r_eq)` pair). The early-exit branches
+        # used to pass two positional arguments, which raised
+        # `TypeError: ... takes 1 positional argument but 2 were given`
+        # for single-chain inputs when guidance is enabled.
         if n_atoms == 0:
-            return _cache_and_return(
+            return _cache_and_return((
                 torch.empty((2, 0), device=device, dtype=torch.long),
                 torch.empty((0,), device=device, dtype=torch.float32),
-            )
+            ))
         # If all atoms map to the same chain id, there is no inter-chain pair.
         if torch.all(c_map == c_map[..., :1]):
-            return _cache_and_return(
+            return _cache_and_return((
                 torch.empty((2, 0), device=device, dtype=torch.long),
                 torch.empty((0,), device=device, dtype=torch.float32),
-            )
+            ))
 
         n_chains = int(c_map.max().item()) + 1
 
