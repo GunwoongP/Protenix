@@ -450,6 +450,8 @@ def parse_tfg_config(guidance_cfg: Mapping[str, Any] | None) -> TFGConfig:
         "steps",
         "terms",
         "log_last_step_energy",
+        "metadiffusion",  # Boltz-compatible metadiffusion list
+        "metadiffusion_globals",  # engine-level knobs emitted by the parser
     }
     extra = set(cfg.keys()) - allowed_top
     if extra:
@@ -470,8 +472,27 @@ def parse_tfg_config(guidance_cfg: Mapping[str, Any] | None) -> TFGConfig:
     inner_steps = max(0, int(steps.get("tfg_inner", 10)))
     projection_outer_steps = max(0, int(steps.get("projection_outer", 2)))
     projection_inner_steps = max(0, int(steps.get("projection_inner", 10)))
-    term_cfg = cfg.get("terms", {})
-    terms = tuple(_build_terms(term_cfg))
+    term_cfg = dict(cfg.get("terms", {}))
+    built: list[Term] = list(_build_terms(term_cfg))
+
+    # Boltz-compatible metadiffusion block: a list of `{steer|opt|...}`
+    # items. The parser emits `(class_name, body)` pairs so the same
+    # potential class can appear multiple times — we instantiate each
+    # one through `_build_terms` singly so duplicate class names are
+    # fine (unlike the legacy `terms:` mapping which is keyed by name).
+    md_list = cfg.get("metadiffusion")
+    if md_list:
+        # Lazy import triggers @register for SteeringPotential / OptPotential.
+        from protenix.tfg.metadiffusion.schema import parse_metadiffusion_block
+        md_terms, md_globals = parse_metadiffusion_block(md_list)
+        for term_name, body in md_terms.items():
+            # `SteeringPotential__0` → base class `SteeringPotential`.
+            base = term_name.split("__", 1)[0]
+            built.extend(_build_terms({base: body}))
+        if md_globals:
+            cfg.setdefault("metadiffusion_globals", md_globals)
+
+    terms = tuple(built)
     if enable and len(terms) == 0:
         raise ValueError("TFG is enabled but no terms are configured")
 

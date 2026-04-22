@@ -5,3 +5,8 @@ This code provides a modular guidance engine that can be plugged into
 
 from .config import Schedule, TFGConfig, parse_tfg_config, schedule_from_cfg
 from .engine import TFGEngine
+
+# Import metadiffusion so that `@register` decorators fire and
+# `SteeringPotential` / `OptPotential` are visible in `CLASS_REGISTRY`
+# before any TFG config is parsed.
+from . import metadiffusion  # noqa: F401
