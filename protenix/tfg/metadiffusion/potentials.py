@@ -160,6 +160,38 @@ def _invoke_cv(
     return value, grad
 
 
+def _resolve_cv_spec(
+    feats: dict[str, Any], params: dict[str, Any]
+) -> tuple[Optional[str], dict[str, Any]]:
+    """Pick the right CV name + kwargs for the calling term.
+
+    Lookup precedence, for correct multi-term routing (Copilot #6):
+
+        1. term-specific keys ``metadiffusion_{cv_name,cv_kwargs}__<term>``
+           (set by schema.build_metadiffusion_features for every term).
+        2. singleton legacy keys ``metadiffusion_{cv_name,cv_kwargs}``
+           (only populated when exactly one term is configured).
+        3. ``params['cv']`` — final fallback so that even without a
+           feature-dict, a user-configured CV name still works.
+
+    Returns ``(cv_name, cv_kwargs)``; ``cv_name`` is None iff no CV is
+    configured (in which case the potential should skip).
+    """
+    term_name = params.get("_term_name")
+    if term_name:
+        cv_name = feats.get(f"metadiffusion_cv_name__{term_name}")
+        cv_kwargs = feats.get(f"metadiffusion_cv_kwargs__{term_name}")
+        if cv_name is not None:
+            return cv_name, cv_kwargs or {}
+    cv_name = feats.get("metadiffusion_cv_name")
+    if cv_name is not None:
+        return cv_name, feats.get("metadiffusion_cv_kwargs") or {}
+    cv_name = params.get("cv")
+    if cv_name is None or cv_name == "None":
+        return None, {}
+    return str(cv_name), {}
+
+
 def _zero_energy(coords: torch.Tensor) -> torch.Tensor:
     return torch.zeros(coords.shape[:-2], device=coords.device, dtype=coords.dtype)
 
@@ -249,8 +281,7 @@ class SteeringPotential(Potential):
                 )
             return _zero_energy_and_grad(coords) if need_grad else _zero_energy(coords)
 
-        cv_name = feats.get("metadiffusion_cv_name", params.get("cv", None))
-        cv_kwargs = feats.get("metadiffusion_cv_kwargs", {})
+        cv_name, cv_kwargs = _resolve_cv_spec(feats, params)
         if cv_name is None:
             if _debug_enabled(params):
                 logger.warning("[metadiff/Steering] no CV set in feats/params; skipping")
@@ -410,16 +441,22 @@ class MetadynamicsPotential(Potential):
 
     def deposit_hill(
         self, cv_value_scalar: float, step_idx: int,
-        height: float, sigma: float,
+        height: float, sigma: float, max_hills: int = 1000,
     ) -> None:
-        """Add one hill, prune FIFO to `max_hills`."""
+        """Add one hill, prune FIFO to ``max_hills``.
+
+        ``max_hills`` is passed in from the resolved params at each
+        ``_eval`` (Copilot #2): a runtime override via the schema or a
+        param schedule now takes effect, instead of being frozen at
+        constructor defaults.
+        """
         self.hills.append({
             "cv_center": float(cv_value_scalar),
             "height": float(height),
             "sigma": float(sigma),
             "step": int(step_idx),
         })
-        max_h = int(self._default_params.get("max_hills", 1000))
+        max_h = max(1, int(max_hills))
         if len(self.hills) > max_h:
             del self.hills[: len(self.hills) - max_h]
 
@@ -440,8 +477,7 @@ class MetadynamicsPotential(Potential):
                 )
             return _zero_energy_and_grad(coords) if need_grad else _zero_energy(coords)
 
-        cv_name = feats.get("metadiffusion_cv_name", params.get("cv", None))
-        cv_kwargs = feats.get("metadiffusion_cv_kwargs", {})
+        cv_name, cv_kwargs = _resolve_cv_spec(feats, params)
         if cv_name is None:
             return _zero_energy_and_grad(coords) if need_grad else _zero_energy(coords)
         cv_function = get_cv(cv_name)
@@ -462,7 +498,11 @@ class MetadynamicsPotential(Potential):
                 h_i = self._well_tempered_height(hill_h0, cv_mean, kT, bias_factor)
             else:
                 h_i = hill_h0
-            self.deposit_hill(cv_mean, self._call_counter, h_i, hill_sigma)
+            max_hills = int(params.get("max_hills", 1000))
+            self.deposit_hill(
+                cv_mean, self._call_counter, h_i, hill_sigma,
+                max_hills=max_hills,
+            )
 
         # Compute bias energy + dV/dCV.
         V, dV_dCV = self._hill_bias(cv_value, hill_sigma)
@@ -533,8 +573,7 @@ class OptPotential(Potential):
         if not _window_active(params):
             return _zero_energy_and_grad(coords) if need_grad else _zero_energy(coords)
 
-        cv_name = feats.get("metadiffusion_cv_name", params.get("cv", None))
-        cv_kwargs = feats.get("metadiffusion_cv_kwargs", {})
+        cv_name, cv_kwargs = _resolve_cv_spec(feats, params)
         if cv_name is None:
             return _zero_energy_and_grad(coords) if need_grad else _zero_energy(coords)
         cv_function = get_cv(cv_name)

@@ -33,8 +33,10 @@ Supported item shapes (MVP)::
           cutoff: 0.8
           log_gradient: true
 
-Everything else in Boltz's schema (explore/saxs/chemical_shift) raises
-``NotImplementedError`` for now — intentional scope for Phase 1.
+In addition to ``steer`` and ``opt``, Phase 2 adds ``explore`` with
+Gaussian-hill deposition (well-tempered supported). SAXS and
+chemical-shift potentials remain ``NotImplementedError`` — they need
+experimental data that's not in scope for CASP17.
 
 Returned shape
 --------------
@@ -115,11 +117,20 @@ def _warn_unsupported_fields(
 def _as_term_body(mode_cfg: dict[str, Any]) -> dict[str, Any]:
     """Copy metadiffusion item body into the shape ``_build_terms`` expects.
 
-    Anything not recognised as a potential param is dropped here
-    (logged once) — the factory (``build_metadiffusion_features``)
-    picks those up separately when constructing CV kwargs.
+    Anything not recognised as a potential param is dropped here —
+    the factory (``build_metadiffusion_features``) picks those up
+    separately when constructing CV kwargs.
+
+    ``cv`` is preserved (under the param key ``cv``) so each term
+    carries its own CV name; this lets a single run stack multiple
+    metadiffusion terms with different CVs without them stepping on
+    each other's ``metadiffusion_cv_name`` slot in ``feats``.
     """
-    return {k: v for k, v in mode_cfg.items() if k not in _CV_SPEC_KEYS}
+    out = {k: v for k, v in mode_cfg.items() if k not in _CV_SPEC_KEYS}
+    cv_name = mode_cfg.get("collective_variable") or mode_cfg.get("cv")
+    if cv_name is not None:
+        out["cv"] = str(cv_name)
+    return out
 
 
 # Keys that describe *CV selection*, not potential behaviour. Consumed
@@ -181,34 +192,31 @@ def parse_metadiffusion_block(
             term_cfg: dict[str, Any] = {
                 "interval": int(body.get("guidance_interval", 1)),
                 "weight": float(body.get("weight", 1.0)),
+                # Injected so the potential can look up its own CV kwargs
+                # in ``feats`` (see build_metadiffusion_features).
+                "_term_name": name,
             }
             term_cfg.update(_as_term_body(body))
-            # The potential reads `mode`, `target`, `strength`, `sigma`,
-            # `warmup`, `cutoff`, `ensemble` directly; pass through.
             terms[name] = term_cfg
 
         elif "explore" in item:
             # Metadynamics hill-deposition mode. Phase 2.
             body = item["explore"]
-            # Only "hills" (and its default alias) explore_type is handled
-            # here; "repulsion" is not yet implemented.
             etype = str(body.get("type", body.get("explore_type", "hills"))).lower()
             if etype == "repulsion":
                 raise NotImplementedError(
                     f"metadiffusion[{i}].explore type 'repulsion' is not "
                     f"supported yet (Phase 2 handles 'hills' / well-tempered)."
                 )
-            if "explore_i" not in locals(): explore_i = 0
             name = f"MetadynamicsPotential__{explore_i}"
             explore_i += 1
             _warn_unsupported_fields(i, name, body)
             term_cfg = {
                 "interval": int(body.get("guidance_interval", 1)),
                 "weight": float(body.get("weight", 1.0)),
+                "_term_name": name,
             }
             term_cfg.update(_as_term_body(body))
-            # Normalise Boltz's "type" field → we keep the engine-facing
-            # name plain (MetadynamicsPotential handles hills only for now).
             term_cfg.pop("type", None)
             term_cfg.pop("explore_type", None)
             terms[name] = term_cfg
@@ -218,24 +226,27 @@ def parse_metadiffusion_block(
             name = f"OptPotential__{opt_i}"
             opt_i += 1
             _warn_unsupported_fields(i, name, body)
-            # "target" in opt is "min" | "max" → translate to direction.
             target = body.get("target", "min")
-            if isinstance(target, str):
-                direction = -1.0 if target.lower() == "max" else +1.0
-            else:
-                # Numeric means "min |CV - target|" which is really
-                # steering; recommend the user switch modes.
+            if not isinstance(target, str):
                 raise ValueError(
                     f"metadiffusion[{i}].opt.target must be 'min' or 'max'; "
                     f"numeric target belongs under `steer:` instead."
                 )
+            t_lower = target.lower()
+            if t_lower not in {"min", "max"}:
+                raise ValueError(
+                    f"metadiffusion[{i}].opt.target: expected 'min' or 'max', "
+                    f"got {target!r}. (typo guard — see issue #8.)"
+                )
+            direction = -1.0 if t_lower == "max" else +1.0
             term_cfg = {
                 "interval": int(body.get("guidance_interval", 1)),
                 "weight": float(body.get("weight", 1.0)),
                 "direction": direction,
+                "_term_name": name,
             }
             term_cfg.update(_as_term_body(body))
-            term_cfg.pop("target", None)  # consumed above
+            term_cfg.pop("target", None)
             terms[name] = term_cfg
 
         elif any(k in item for k in _UNSUPPORTED_KEYS):
@@ -413,7 +424,15 @@ def build_metadiffusion_features(
         else:
             continue
 
-        cv_name = str(body.get("collective_variable") or body.get("cv"))
+        # Early validation (Copilot #7): refuse silent 'None' fallbacks.
+        cv_raw = body.get("collective_variable") or body.get("cv")
+        if cv_raw is None:
+            raise KeyError(
+                f"metadiffusion[{i}].{'steer' if 'steer' in item else ('opt' if 'opt' in item else 'explore')}: "
+                f"missing 'collective_variable' (or 'cv') key. "
+                f"Metadiffusion requires a named CV."
+            )
+        cv_name = str(cv_raw)
         cv_kwargs: dict[str, Any] = {}
 
         # ── 1. Atom selection: `region1..4` takes precedence over `groups` ──
@@ -500,8 +519,13 @@ def build_metadiffusion_features(
         })
 
     out: dict[str, Any] = {"metadiffusion_terms": terms_info}
-    # Convenience: if only one term, expose at top-level too so
-    # potentials can look it up without iterating.
+    # Per-term prefixed entries so a potential can route to its own
+    # CV / kwargs via ``params["_term_name"]`` without interfering
+    # with sibling terms that pick a different CV (issue #6).
+    for t in terms_info:
+        out[f"metadiffusion_cv_name__{t['term']}"] = t["cv"]
+        out[f"metadiffusion_cv_kwargs__{t['term']}"] = t["cv_kwargs"]
+    # Legacy single-term convenience: unchanged for backward compat.
     if len(terms_info) == 1:
         out["metadiffusion_cv_name"] = terms_info[0]["cv"]
         out["metadiffusion_cv_kwargs"] = terms_info[0]["cv_kwargs"]

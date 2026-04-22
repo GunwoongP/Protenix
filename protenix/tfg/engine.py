@@ -472,18 +472,21 @@ class TFGEngine:
                     log_components=log_components,
                 )
 
-                # Metadiffusion total_bias_clip: cap per-atom update
-                # magnitude so one runaway potential cannot dominate.
-                # Boltz scales `sigma_scale_total = max(1.0, sigma_t/100)`
-                # to keep the clip loose at high noise; we follow the
-                # same recipe so user-facing threshold stays consistent.
+                # Metadiffusion total_bias_clip: cap the final per-atom
+                # UPDATE magnitude (i.e. `grad_x0 * mu`, which is what
+                # actually moves coords). Boltz scales the clip by
+                # `max(1, sigma_t/100)` so it stays loose at high noise.
+                # NOTE: we divide by `mu` here because the clip is
+                # expressed in coordinate (Å) units but applied to the
+                # raw gradient — the next line multiplies by `mu` again.
                 clip = getattr(self.cfg, "total_bias_clip", None)
-                if clip is not None and clip > 0:
+                if clip is not None and clip > 0 and float(self.cfg.mu) > 0:
                     import torch as _torch
                     _t_hat_scalar = float(t_hat.mean().item()) if hasattr(t_hat, "mean") else float(t_hat)
                     sigma_scale = max(1.0, _t_hat_scalar / 100.0)
-                    effective = float(clip) * sigma_scale * float(self.cfg.mu)
-                    # Per-atom gradient norm clipping.
+                    # Target step cap (in Å): `clip * sigma_scale`.
+                    # Raw-grad cap = step cap / mu  (since update = grad * mu).
+                    effective = float(clip) * sigma_scale / float(self.cfg.mu)
                     g_norm = grad_x0.norm(dim=-1, keepdim=True)
                     scale = _torch.where(
                         g_norm > effective,

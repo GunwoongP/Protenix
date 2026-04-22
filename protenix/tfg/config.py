@@ -226,11 +226,17 @@ class Term:
         """Materialize parameters for time `t`.
 
         Any parameter value that is a `Schedule` is evaluated at `t`; other
-        values are passed through unchanged.
+        values are passed through unchanged. The normalised time `t` itself
+        is injected as `_t` / `_relaxation` so potentials that gate on the
+        diffusion progress (e.g. MetaDiffusion `warmup` / `cutoff`) can
+        read it from `params`. We do NOT clobber a user-provided `_t`.
         """
-        out = {}
+        out: dict[str, Any] = {}
         for k, v in self.param_templates.items():
             out[k] = v(t) if isinstance(v, Schedule) else v
+        # Progress knobs (read by `_time_progress` in metadiffusion.potentials).
+        out.setdefault("_t", float(t))
+        out.setdefault("_relaxation", float(t))
         return out
 
     def energy(
