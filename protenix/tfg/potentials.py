@@ -1406,8 +1406,11 @@ class TemplateReferencePotential(Potential):
     Expected feats
     --------------
     template_cb : `[N_tmpl, N_token, 3]` (or `[N_token, 3]` if single template)
-        Template positions (typically Cβ for protein residues, C3'/C1' for
-        nucleic acids) in the query token order.
+        Template positions, one per query token, taken at the atom name the
+        tokenizer assigned as the token's centre atom — Cα for standard
+        amino acids (see `AddAtomArrayAnnot.add_centre_atom_mask`), C1' for
+        nucleotides, and the sole heavy atom for ligand tokens. The name
+        `template_cb` is kept for Boltz-2 compatibility; it is *not* Cβ.
     template_mask_cb : `[N_tmpl, N_token]` (or `[N_token]`)
         Validity mask (True where template data exists for that token).
     token_centre_atom_idx : `[N_token]` long

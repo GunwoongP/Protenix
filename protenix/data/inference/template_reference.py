@@ -34,6 +34,7 @@ Mapping rules
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from typing import Any
@@ -43,7 +44,13 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Cap trunk templates at the same limit the rest of Protenix assumes
+# (`TemplateFeatureAssemblyLine(max_templates=4)`). Exceeding this would
+# inflate O(N_tmpl * N_token^2) derived features (distogram, unit_vector).
+_MAX_TRUNK_TEMPLATES = 4
 
+
+@functools.lru_cache(maxsize=8)
 def _read_template_atom_lookup(
     cif_path: str,
 ) -> tuple[dict[tuple[str, int, str], np.ndarray], dict[tuple[str, int], str]]:
@@ -416,12 +423,27 @@ def build_trunk_template_features(
     for c in query_chain_seqs:
         query_chain_seqs[c].sort()
 
+    # Cap template count to the assembly-line default so that
+    # O(N_tmpl * N_token^2) derived features (distogram / unit_vector)
+    # stay bounded. Extra templates are dropped with a warning.
+    if len(templates) > _MAX_TRUNK_TEMPLATES:
+        logger.warning(
+            "[template_reference/trunk] %d templates provided, keeping the "
+            "first %d (Protenix `TemplateFeatureAssemblyLine` default). "
+            "Dropping: %s",
+            len(templates), _MAX_TRUNK_TEMPLATES,
+            [os.path.basename(t.get("cif", "?")) for t in templates[_MAX_TRUNK_TEMPLATES:]],
+        )
+        templates = templates[:_MAX_TRUNK_TEMPLATES]
+
     # Allocate output arrays (Protenix DENSE_ATOM max width).
+    # `atom_mask` is bool to match the existing template pipeline
+    # (`TemplateFeatureAssemblyLine` casts via `.astype(bool)`).
     N_dense = max(len(v) for v in DENSE_ATOM.values())
     n_tmpl = len(templates)
     aatype = np.full((n_tmpl, n_token), GAP_IDX, dtype=np.int64)
     atom_positions = np.zeros((n_tmpl, n_token, N_dense, 3), dtype=np.float32)
-    atom_mask = np.zeros((n_tmpl, n_token, N_dense), dtype=np.float32)
+    atom_mask = np.zeros((n_tmpl, n_token, N_dense), dtype=bool)
 
     for k, tmpl in enumerate(templates):
         cif_path = tmpl["cif"]
@@ -453,18 +475,24 @@ def build_trunk_template_features(
             t_res = q_res - offsets.get(q_chain, 0)
 
             # Boltz convention: template aatype / atom list follow the
-            # TEMPLATE residue identity. When the template is missing the
-            # aligned residue entirely, we leave `aatype` at GAP and
-            # `atom_mask` at 0 so the embedder sees no template signal
-            # there — no query fallback (it would inject a wrong residue
-            # type even though atoms are masked out).
+            # TEMPLATE residue identity. Three cases:
+            #   (a) no residue at (t_chain, t_res)  → aatype=GAP, mask=0
+            #   (b) residue present but non-standard (not in ATOM14)
+            #       → aatype=UNK (embedder sees "residue exists, type
+            #         unknown"), mask=0 (no canonical atom order)
+            #   (c) residue present and standard → aatype=<AA idx>, fill
+            #       ATOM14 slots from the lookup.
             t_res3 = res_name_by_pos.get((t_chain, t_res))
-            if t_res3 is None or t_res3 not in ATOM14:
+            if t_res3 is None:
+                continue  # case (a): keep GAP default
+            if t_res3 not in ATOM14:
+                aatype[k, tok_i] = UNK_IDX  # case (b)
                 continue
             one_letter = _THREE_TO_ONE.get(t_res3)
             if one_letter is None or one_letter not in _ONE_TO_IDX:
+                aatype[k, tok_i] = UNK_IDX  # case (b) via different path
                 continue
-            aatype[k, tok_i] = _ONE_TO_IDX[one_letter]
+            aatype[k, tok_i] = _ONE_TO_IDX[one_letter]  # case (c)
 
             atom_names = ATOM14[t_res3]  # canonical per-residue order (template)
             res_hit = False
