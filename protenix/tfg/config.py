@@ -181,6 +181,11 @@ _REQUIRED_FEATURES: dict[str, set[str]] = {
         "experimental_torsion_force_constant",
         "experimental_torsion_sign",
     },
+    "TemplateReferencePotential": {
+        "template_cb",
+        "template_mask_cb",
+        "token_centre_atom_idx",
+    },
 }
 
 
@@ -350,9 +355,15 @@ def _build_terms(term_cfg: Mapping[str, Any] | None) -> list[Term]:
 def validate_features(feats: Mapping[str, Any], terms: Iterable[Term]) -> None:
     """
     Validate that `feats` contains required keys for all configured terms.
+
+    Disabled terms (``interval <= 0``) are skipped so that listing a potential
+    in the default config with ``interval=-1`` does not force every guidance
+    run to supply its features.
     """
     missing: dict[str, list[str]] = {}
     for term in terms:
+        if term.interval <= 0:
+            continue
         need = term.required_features()
         if not need:
             continue

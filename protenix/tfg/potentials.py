@@ -1377,3 +1377,197 @@ class VinaStericPotential(Potential):
         if len(batch_shape) == 0:
             return e_out[0], g_out
         return e_out.reshape(*batch_shape), g_out
+
+
+@register
+class TemplateReferencePotential(Potential):
+    """Pull atoms toward template reference coordinates (Boltz-style).
+
+    Soft constraint that guides diffusion to stay within `template_force_threshold`
+    of one or more structural templates (e.g. FFT-docked poses). Feature
+    contract and overall algorithm mirror Boltz-2's `TemplateReferencePotential`
+    (NVIDIA NIM tensorrt_bionemo), adapted to Protenix TFG's `_eval(coords, ...)`
+    signature.
+
+    Algorithm
+    ---------
+    1. Gather token-representative coords from full atom coords via
+       `token_centre_atom_idx`.
+    2. Filter templates: only those with `template_force[k] == True` contribute.
+    3. For each surviving template k:
+       a) Rigid-align `template_cb[k]` onto current token coords using
+          `weighted_rigid_align` (AF3 Alg 28, mask-weighted).
+       b) Per-token residual `r_i = token_coord_i - aligned_ref_i[k]`.
+       c) Flat-bottom upper-bound energy on `||r_i||` with threshold
+          `template_force_threshold[k]`. Masked tokens contribute zero.
+    4. Sum per-template energies. Scatter token gradients back to the
+       representative atom via `index_add_`.
+
+    Expected feats
+    --------------
+    template_cb : `[N_tmpl, N_token, 3]` (or `[N_token, 3]` if single template)
+        Template positions, one per query token, taken at the atom name the
+        tokenizer assigned as the token's centre atom — Cα for standard
+        amino acids (see `AddAtomArrayAnnot.add_centre_atom_mask`), C1' for
+        nucleotides, and the sole heavy atom for ligand tokens. The name
+        `template_cb` is kept for Boltz-2 compatibility; it is *not* Cβ.
+    template_mask_cb : `[N_tmpl, N_token]` (or `[N_token]`)
+        Validity mask (True where template data exists for that token).
+    token_centre_atom_idx : `[N_token]` long
+        For each token, the atom index of its centre atom in the full atom array.
+
+    Optional feats
+    --------------
+    template_force : `[N_tmpl]` bool
+        Selector: only rows with True contribute. If absent, all templates are
+        used.
+    template_force_threshold : `[N_tmpl]` float
+        Per-template distance cutoff (Å). If absent, uses param `threshold`.
+
+    Params
+    ------
+    threshold : float, default 2.0
+        Fallback per-template cutoff when `template_force_threshold` feat is
+        not provided.
+    mode : {"parabolic", "linear"}, default "parabolic"
+        Flat-bottom penalty shape beyond threshold.
+    rigid_align : bool, default True
+        If True, run `weighted_rigid_align` before the residual. Disable only
+        when the template is already in the predicted coord frame.
+    """
+
+    def __init__(self, default_params: Optional[dict[str, Any]] = None):
+        defaults = {"threshold": 2.0, "mode": "parabolic", "rigid_align": True}
+        if default_params is not None:
+            defaults.update(default_params)
+        super().__init__(defaults)
+
+    def _eval(self, coords, feats, params, need_grad: bool):
+        template_cb = feats.get("template_cb", None)
+        template_mask_cb = feats.get("template_mask_cb", None)
+        centre_idx = feats.get("token_centre_atom_idx", None)
+        if template_cb is None or template_mask_cb is None or centre_idx is None:
+            return (
+                _zeros_energy_and_grad(coords) if need_grad else _zeros_energy(coords)
+            )
+
+        # Normalize template tensors to [N_tmpl, N_token, ...]
+        if template_cb.ndim == 2:
+            template_cb = template_cb.unsqueeze(0)
+            template_mask_cb = template_mask_cb.unsqueeze(0)
+
+        # Filter templates by force flag (default: use all). `template_force`
+        # can arrive on CPU even when `template_cb` has already been moved to
+        # the model device by the collator, so align the mask to the data
+        # tensor before indexing to avoid a device-mismatch error.
+        force = feats.get("template_force", None)
+        if force is not None:
+            force_mask = force.to(torch.bool).to(template_cb.device)
+            template_cb = template_cb[force_mask]
+            template_mask_cb = template_mask_cb[force_mask.to(template_mask_cb.device)]
+            n_active = int(template_cb.shape[0])
+            if n_active == 0:
+                return (
+                    _zeros_energy_and_grad(coords)
+                    if need_grad
+                    else _zeros_energy(coords)
+                )
+            thresh_feat = feats.get("template_force_threshold", None)
+            if thresh_feat is not None:
+                thresh_feat = thresh_feat[force_mask.to(thresh_feat.device)]
+                thresholds = thresh_feat.to(coords.dtype).to(coords.device)
+            else:
+                thresholds = torch.full(
+                    (n_active,),
+                    float(params["threshold"]),
+                    dtype=coords.dtype,
+                    device=coords.device,
+                )
+        else:
+            n_active = int(template_cb.shape[0])
+            thresh_feat = feats.get("template_force_threshold", None)
+            if thresh_feat is not None:
+                thresholds = thresh_feat.to(coords.dtype).to(coords.device)
+            else:
+                thresholds = torch.full(
+                    (n_active,),
+                    float(params["threshold"]),
+                    dtype=coords.dtype,
+                    device=coords.device,
+                )
+
+        # Gather token-representative coords from full atom coords.
+        # coords: [..., N_atom, 3]; centre_idx: [N_token] → [..., N_token, 3]
+        centre_idx_l = centre_idx.to(coords.device).long()
+        token_coords = coords.index_select(-2, centre_idx_l)
+
+        template_cb = template_cb.to(coords.dtype).to(coords.device)
+        template_mask_cb = template_mask_cb.to(coords.dtype).to(coords.device)
+
+        total_energy = torch.zeros(
+            coords.shape[:-2], device=coords.device, dtype=coords.dtype
+        )
+        grad_atoms = torch.zeros_like(coords) if need_grad else None
+
+        mode = str(params.get("mode", "parabolic")).lower()
+        rigid = bool(params.get("rigid_align", True))
+        if rigid:
+            from protenix.metrics.rmsd import weighted_rigid_align
+
+        for k in range(n_active):
+            ref_tok = template_cb[k]  # [N_token, 3]
+            mask_tok = template_mask_cb[k]  # [N_token]
+            if not torch.any(mask_tok):
+                continue
+
+            # Broadcast ref to coords batch shape. `token_coords` may carry
+            # arbitrary leading batch dims (`[..., N_token, 3]`) while
+            # `ref_tok` is `[N_token, 3]`; add size-1 leading dims so the
+            # shapes line up before expand.
+            extra = token_coords.ndim - ref_tok.ndim
+            if extra > 0:
+                ref_expanded = ref_tok.reshape((1,) * extra + ref_tok.shape)
+                ref_expanded = ref_expanded.expand_as(token_coords)
+            else:
+                ref_expanded = ref_tok.expand_as(token_coords)
+            if rigid:
+                # `weighted_rigid_align` calls `torch.linalg.svd`, which does
+                # not support fp16/bf16 and errors under AMP. Disable autocast
+                # and run the alignment in fp32, then cast back.
+                with torch.amp.autocast(coords.device.type, enabled=False):
+                    ref_aligned = weighted_rigid_align(
+                        x=ref_expanded.float(),
+                        x_target=token_coords.float(),
+                        atom_weight=mask_tok.float(),
+                        stop_gradient=True,
+                    )
+                ref_aligned = ref_aligned.to(coords.dtype)
+            else:
+                ref_aligned = ref_expanded
+
+            diff = token_coords - ref_aligned  # [..., N_token, 3]
+            dist = torch.linalg.norm(diff, dim=-1).clamp_min(1e-8)  # [..., N_token]
+
+            # `thresholds[k]` is a 0-d device tensor; relying on broadcast
+            # inside `_flat_bottom_*` keeps this loop host-sync-free.
+            # (Previously: `torch.full_like(dist, float(thresholds[k]))` forced
+            # a device-to-host copy per template per step.)
+            upper = thresholds[k]
+            if mode == "linear":
+                e, de_dd = _flat_bottom_linear(dist, 1.0, None, upper)
+            else:
+                e, de_dd = _flat_bottom_parabolic(dist, 1.0, None, upper)
+
+            e = e * mask_tok
+            total_energy = total_energy + e.sum(dim=-1)
+
+            if need_grad:
+                direction = diff / dist.unsqueeze(-1)
+                grad_token = (de_dd * mask_tok).unsqueeze(-1) * direction
+                # Scatter per-token gradient to representative atom.
+                grad_atoms.index_add_(-2, centre_idx_l, grad_token)
+
+        if need_grad:
+            return total_energy, grad_atoms
+        return total_energy
+
