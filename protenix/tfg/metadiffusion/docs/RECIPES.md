@@ -231,7 +231,10 @@ metadiffusion:
       cutoff: 0.95
 ```
 
-For TM-score based (tolerant of local coil differences):
+For TM-score based (tolerant of local coil differences), **use only
+after rmsd has pulled samples into the same basin** — the TM curve
+is flat for d ≫ d0, so the gradient is weak when samples are far
+from the reference.
 
 ```yaml
   - steer:
@@ -245,9 +248,18 @@ For TM-score based (tolerant of local coil differences):
       cutoff: 0.95
 ```
 
-**Known gotcha**: at strength 5 we measured RMSD stuck at ~13 Å
-(base intrinsic variance). Reference steering needs ≥30 for rmsd /
-drmsd and ≥20 for d_tm.
+### Validated strength table (from actual measurements)
+
+| base-to-ref distance | CV | strength | result |
+|---|---|---|---|
+| ~13 Å RMSD | `rmsd` + `log_gradient` | **30** | **12.94 → 3.23 Å** (strong pull) |
+| ~8 Å dRMSD | `drmsd` + `log_gradient` | **30** | **7.57 → 2.51 Å** |
+| TM ~0.30 → target 0.95 | `d_tm` alone | 30 | TM stayed 0.24 (too far, flat grad) |
+| TM ~0.80 → target 0.95 | `d_tm` | 20 | works as fine-tuning |
+
+**Rule of thumb**: first use `rmsd` to pull into the same basin
+(RMSD < 5 Å), then switch to `d_tm` for fine-tuning if you care
+about TM specifically.
 
 ---
 
