@@ -85,8 +85,10 @@ _ADVANCED_IGNORED_FIELDS = {
     "bias_tempering",
     # CV auto-tuning
     "target_from_saxs", "auto_rg_scale", "gaussian_noise_scale",
-    # Boltz-specific selection hints that our parser does not honour
-    "atom1", "atom2", "atom3", "atom4",
+    # Boltz-specific selection hints that our parser does not honour.
+    # NB: ``atom1``..``atom4`` are now parsed below into mask1/mask2
+    # (for ``distance``) or atom{1..4}_idx (for ``angle``/``dihedral``),
+    # so they moved OUT of the silent-ignore list.
     "rmsd_groups", "selection",
     # SASA params beyond what our simple CV honours (probe_radius is
     # accepted; sasa_method (LCPO vs Shrake–Rupley) is not).
@@ -215,13 +217,17 @@ def parse_metadiffusion_block(
             terms[name] = term_cfg
 
         elif "explore" in item:
-            # Metadynamics hill-deposition mode. Phase 2.
+            # Metadynamics explore mode — two flavours:
+            #   "hills"     : deposit Gaussian hills at visited CV values
+            #                 (well-tempered optional). Stateful.
+            #   "repulsion" : Boltz-style pairwise Gaussian between
+            #                 per-sample CV values. Stateless.
             body = item["explore"]
             etype = str(body.get("type", body.get("explore_type", "hills"))).lower()
-            if etype == "repulsion":
+            if etype not in {"hills", "repulsion"}:
                 raise NotImplementedError(
-                    f"metadiffusion[{i}].explore type 'repulsion' is not "
-                    f"supported yet (Phase 2 handles 'hills' / well-tempered)."
+                    f"metadiffusion[{i}].explore type {etype!r} is not "
+                    f"supported (expected 'hills' or 'repulsion')."
                 )
             name = f"MetadynamicsPotential__{explore_i}"
             explore_i += 1
@@ -230,10 +236,13 @@ def parse_metadiffusion_block(
                 "interval": int(body.get("guidance_interval", 1)),
                 "weight": float(body.get("weight", 1.0)),
                 "_term_name": name,
+                # Preserve the explore_type for the potential.
+                "explore_type": etype,
             }
             term_cfg.update(_as_term_body(body))
             term_cfg.pop("type", None)
-            term_cfg.pop("explore_type", None)
+            # explore_type was stored above, make sure it survives.
+            term_cfg["explore_type"] = etype
             terms[name] = term_cfg
 
         elif "opt" in item:
@@ -526,10 +535,51 @@ def build_metadiffusion_features(
             cv_kwargs["reference_mask"] = sel_mask
 
         # ── 3. CV-specific params (forward to CV function as kwargs) ──
+        # Each name here is a kwarg of at least one CV function. Keeping
+        # the list explicit (rather than "pass-through anything unknown")
+        # means a typo in YAML still raises via the default unsupported-
+        # field warning path instead of silently ignoring.
         for k in ("contact_cutoff", "beta", "probe_radius", "atom_radius",
-                  "n_quad", "chunk_size"):
+                  "n_quad", "chunk_size",
+                  # pair_tm / pair_itm (Codex PR#2 round 2):
+                  "d0", "interface_cutoff"):
             if k in body:
                 cv_kwargs[k] = body[k]
+
+        # ── 3b. Named atoms (``atom1``..``atom4``) from Boltz YAML ──
+        # These were previously in _ADVANCED_IGNORED_FIELDS, which meant
+        # distance / angle / dihedral silently received no masks and
+        # returned zero gradient. Now we parse each region spec and wire
+        # the result into the right CV kwarg:
+        #   distance : atom1 → mask1, atom2 → mask2
+        #   angle    : atom1/2/3 → atom1_idx/atom2_idx/atom3_idx
+        #   dihedral : atom1/2/3/4 → atom{N}_idx
+        # We accept any ``_parse_region_spec`` grammar (``A:10:CA``,
+        # ``A:10-15:CA``, etc.). For the ``*_idx`` kwargs we take the
+        # first True entry of the parsed mask.
+        atom_keys = [f"atom{n}" for n in (1, 2, 3, 4)]
+        atom_specs_present = [k for k in atom_keys if k in body]
+        if atom_specs_present:
+            parsed_masks: list[torch.Tensor] = []
+            parsed_indices: list[int] = []
+            for k in atom_keys:
+                if k not in body:
+                    continue
+                mask_np = _parse_region_spec(str(body[k]), atom_array)
+                mask_t = torch.from_numpy(mask_np.astype(bool))
+                if int(mask_t.sum().item()) == 0:
+                    raise KeyError(
+                        f"metadiffusion[{i}].{'steer' if 'steer' in item else 'opt'}: "
+                        f"{k}='{body[k]}' matched zero atoms."
+                    )
+                parsed_masks.append(mask_t)
+                parsed_indices.append(int(mask_t.nonzero(as_tuple=False)[0].item()))
+            if cv_name == "distance" and len(parsed_masks) >= 2:
+                cv_kwargs.setdefault("mask1", parsed_masks[0])
+                cv_kwargs.setdefault("mask2", parsed_masks[1])
+            elif cv_name in {"angle", "dihedral"}:
+                for ii, idx in enumerate(parsed_indices, start=1):
+                    cv_kwargs[f"atom{ii}_idx"] = idx
 
         # ── 4. Silently-ignored Boltz advanced fields → WARN ──
         _warn_unsupported_fields(i, term_name, body)

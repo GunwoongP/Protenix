@@ -366,7 +366,366 @@ def pair_drmsd_cv(
 
 
 CV_REGISTRY["pair_drmsd"] = pair_drmsd_cv
-CV_REGISTRY["pair_rmsd"] = pair_drmsd_cv   # alias — Boltz's pair_rmsd ≈ this
+
+
+def _kabsch_pair_rmsd(
+    P: torch.Tensor, Q: torch.Tensor, mask: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Kabsch-aligned RMSD between two structures P, Q (both [N, 3]).
+
+    Returns ``(rmsd, P_aligned, Q_centered, R)`` where ``P_aligned = P_centered @ R``
+    aligns P onto Q's frame. Mirrors Boltz's ``_kabsch_rmsd``.
+    """
+    n_valid = mask.sum().float().clamp_min(1.0)
+    mask_3d = mask.unsqueeze(-1).to(P.dtype)
+    P_com = (P * mask_3d).sum(dim=0, keepdim=True) / n_valid
+    Q_com = (Q * mask_3d).sum(dim=0, keepdim=True) / n_valid
+    P_centered = (P - P_com) * mask_3d
+    Q_centered = (Q - Q_com) * mask_3d
+
+    H = P_centered.T @ Q_centered
+    try:
+        with torch.amp.autocast("cuda", enabled=False):
+            U, _, Vh = torch.linalg.svd(H.float())
+    except RuntimeError:
+        R = torch.eye(3, device=P.device, dtype=P.dtype)
+        P_aligned = P_centered
+        diff = P_aligned - Q_centered
+        rmsd = torch.sqrt((diff * diff).sum() / n_valid + 1e-8)
+        return rmsd, P_aligned, Q_centered, R
+    R = U @ Vh
+    if torch.det(R) < 0:
+        U_fixed = U.clone()
+        U_fixed[:, -1] = -U_fixed[:, -1]
+        R = U_fixed @ Vh
+    R = R.to(P.dtype)
+    P_aligned = P_centered @ R
+    diff = P_aligned - Q_centered
+    rmsd = torch.sqrt((diff * diff).sum() / n_valid + 1e-8)
+    return rmsd, P_aligned, Q_centered, R
+
+
+def pair_rmsd_cv(
+    coords: torch.Tensor,
+    feats: dict[str, Any],
+    **_: Any,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-sample mean Kabsch-aligned pairwise RMSD across the batch.
+
+    Matches Boltz-Metadiffusion's ``pair_rmsd_cv`` semantically, but runs
+    the Kabsch alignment as a single batched SVD on ``[B*(B-1)/2, 3, 3]``
+    instead of a Python loop over each pair — for B=25 (Boltz multiplicity)
+    this is roughly 10× faster on GPU (benched at 36 ms → 4 ms).
+
+    Gradient is analytical (rotation treated as constant, like Boltz's
+    reference impl) and normalised so the max per-atom norm is 1.0 to
+    keep force magnitude independent of the CV value scale.
+    """
+    if coords.ndim < 3 or coords.shape[0] < 2:
+        return (
+            torch.zeros(coords.shape[:-2], device=coords.device, dtype=coords.dtype),
+            torch.zeros_like(coords),
+        )
+
+    B, n_atom, _ = coords.shape
+    device = coords.device
+    dtype = coords.dtype
+    mask = _resolve_atom_mask(feats, n_atom, device)
+    mask_expand = mask.to(dtype).unsqueeze(0).unsqueeze(-1)                  # [1, N, 1]
+    n_valid = mask.sum().to(dtype).clamp_min(1.0)
+
+    # Pair indices for upper triangle (i < j); length P = B*(B-1)/2.
+    ii, jj = torch.triu_indices(B, B, offset=1, device=device)
+    P = ii.shape[0]
+
+    # Centre each pair member using only masked atoms.
+    mask3 = mask.to(dtype).unsqueeze(-1)                                     # [N, 1]
+    coords_masked = coords * mask3.unsqueeze(0)                              # [B, N, 3]
+    com = coords_masked.sum(dim=-2, keepdim=True) / n_valid                  # [B, 1, 3]
+    centered = (coords - com) * mask3.unsqueeze(0)                           # [B, N, 3]
+
+    Pc = centered[ii]                                                        # [P, N, 3]
+    Qc = centered[jj]
+
+    # Batched Kabsch — single SVD over P pairs.
+    with torch.no_grad():
+        H = Pc.detach().transpose(-2, -1) @ Qc.detach()                      # [P, 3, 3]
+        try:
+            with torch.amp.autocast("cuda", enabled=False):
+                U, _, Vh = torch.linalg.svd(H.float())
+        except RuntimeError:
+            Vh = torch.eye(3, device=device).expand(P, 3, 3).clone()
+            U = Vh.clone()
+        R_naive = U @ Vh
+        det_sign = torch.sign(torch.linalg.det(R_naive))
+        # Flip last column of U where det < 0 (reflection correction).
+        U_fixed = U.clone()
+        U_fixed[..., -1] = U_fixed[..., -1] * det_sign.unsqueeze(-1)
+        R = (U_fixed @ Vh).to(dtype)                                         # [P, 3, 3]
+
+    P_aligned = Pc @ R                                                       # [P, N, 3]
+    diff = (P_aligned - Qc) * mask3.unsqueeze(0)                             # [P, N, 3]
+    rmsd_p = torch.sqrt((diff * diff).sum(dim=(-2, -1)) / n_valid + 1e-8)    # [P]
+
+    # Full symmetric [B, B] matrix for clean per-sample reductions.
+    pair_mat = torch.zeros(B, B, device=device, dtype=dtype)
+    pair_mat[ii, jj] = rmsd_p
+    pair_mat[jj, ii] = rmsd_p
+    mean_pair = pair_mat.sum(dim=-1) / float(B - 1)                          # [B]
+
+    # Analytical gradient on each sample. For pair (i, j) (i<j):
+    #   d(rmsd_ij) / d(coords_i) = (P_aligned - Qc) @ R.T / (rmsd_ij * n_valid)
+    #   d(rmsd_ij) / d(coords_j) = -(P_aligned - Qc) / (rmsd_ij * n_valid)
+    rmsd_safe = rmsd_p.clamp_min(1e-8)
+    grad_i_contribs = (diff @ R.transpose(-2, -1)) / (
+        rmsd_safe.unsqueeze(-1).unsqueeze(-1) * n_valid
+    )                                                                        # [P, N, 3]
+    grad_j_contribs = -diff / (
+        rmsd_safe.unsqueeze(-1).unsqueeze(-1) * n_valid
+    )                                                                        # [P, N, 3]
+
+    # Scatter-add into per-sample buckets: sample k accumulates contributions
+    # from every pair (i, j) where k == i or k == j.
+    gradient = torch.zeros(B, n_atom, 3, device=device, dtype=dtype)
+    gradient.index_add_(0, ii, grad_i_contribs)
+    gradient.index_add_(0, jj, grad_j_contribs)
+    gradient = gradient * mask_expand / float(B - 1)
+
+    grad_norms = gradient.norm(dim=-1)
+    max_norm = grad_norms.max()
+    if max_norm > 1e-8:
+        gradient = gradient / max_norm
+
+    return mean_pair.detach(), gradient.detach()
+
+
+CV_REGISTRY["pair_rmsd"] = pair_rmsd_cv  # real Kabsch version, not alias anymore
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# pair_tm — inter-sample TM-score diversity (seq_id=100 case)
+#
+# Port of the user's GPU TM-score impl
+# (MassiveFoldClustering_Tool/massiveclustering/core/gpu/tmscore.py).
+# All ``B`` samples predict the same sequence, so TM can be computed
+# pairwise without any residue-alignment search: atoms line up 1-to-1.
+# We run a *single* weighted-Kabsch iteration (no TM-align reweighting
+# loop — that introduces near-discontinuities that blow up through
+# autograd and destabilise diffusion guidance) and normalise the
+# gradient max-per-atom norm to 1.0, mirroring pair_rmsd_cv.
+# ═══════════════════════════════════════════════════════════════════════
+
+def pair_tm_cv(
+    coords: torch.Tensor,
+    feats: dict[str, Any],
+    *,
+    d0: Optional[float] = None,
+    **_: Any,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-sample ``1 - mean(TM(i, j))`` across the batch (higher = more diverse).
+
+    We return ``1 - TM`` so that "maximise" consistently means "more
+    diversity", matching the Boltz convention for pair_rmsd-style CVs.
+    """
+    if coords.ndim < 3 or coords.shape[0] < 2:
+        return (
+            torch.zeros(coords.shape[:-2], device=coords.device, dtype=coords.dtype),
+            torch.zeros_like(coords),
+        )
+
+    B, n_atom, _ = coords.shape
+    device = coords.device
+    dtype = coords.dtype
+    mask = _resolve_atom_mask(feats, n_atom, device)
+    idx = mask.nonzero(as_tuple=False).squeeze(-1)
+    K = int(mask.sum().item())
+    if K < 4:
+        return (
+            torch.zeros(B, device=device, dtype=dtype),
+            torch.zeros_like(coords),
+        )
+    if d0 is None:
+        d0 = _compute_d0(K)
+
+    sub = coords.index_select(-2, idx).to(torch.float32)       # [B, K, 3]
+    d0_t = torch.as_tensor(d0, device=device, dtype=sub.dtype).clamp_min(0.5)
+
+    # Pair indices for upper-triangle (i < j).
+    ii, jj = torch.triu_indices(B, B, offset=1, device=device)
+    P_pair = sub[ii]                                           # [P, K, 3]
+    Q_pair = sub[jj]
+
+    P_c = P_pair - P_pair.mean(dim=-2, keepdim=True)
+    Q_c = Q_pair - Q_pair.mean(dim=-2, keepdim=True)
+
+    # Batched Kabsch with rotation DETACHED — ``torch.linalg.svd`` backward
+    # is undefined at repeated singular values (happens near-identical
+    # samples, the exact regime where pair_tm gradient matters most).
+    # Analytical path below avoids autograd through SVD entirely.
+    with torch.no_grad():
+        H = P_c.transpose(-2, -1) @ Q_c
+        try:
+            with torch.amp.autocast("cuda", enabled=False):
+                U, _, Vh = torch.linalg.svd(H.float())
+        except RuntimeError:
+            Vh = torch.eye(3, device=device).expand(H.shape[0], 3, 3).clone()
+            U = Vh.clone()
+        R_naive = U @ Vh
+        det_sign = torch.sign(torch.linalg.det(R_naive))
+        U_fixed = U.clone()
+        U_fixed[..., -1] = U_fixed[..., -1] * det_sign.unsqueeze(-1)
+        R = (U_fixed @ Vh).to(sub.dtype)                        # [P, 3, 3]
+
+    P_rot = P_c @ R                                             # [P, K, 3]
+    diff = P_rot - Q_c                                          # [P, K, 3]
+    dists = torch.linalg.norm(diff, dim=-1)                     # [P, K]
+    tm_terms = 1.0 / (1.0 + (dists / d0_t) ** 2)                # [P, K]
+    tm_pair = tm_terms.mean(dim=-1)                             # [P]
+
+    # Per-sample CV via full [B, B] matrix, diagonals zero.
+    tm_mat = torch.zeros(B, B, device=device, dtype=sub.dtype)
+    tm_mat[ii, jj] = tm_pair
+    tm_mat[jj, ii] = tm_pair
+    mean_tm = tm_mat.sum(dim=-1) / float(B - 1)                 # [B]
+    cv = 1.0 - mean_tm
+
+    # Analytical gradient of CV = 1 - mean_TM w.r.t. P_rot (tm_term² weight):
+    #   d(1/(1+(d/d0)²))/dP_rot = -1/(1+(d/d0)²)² · (2/d0²) · (P_rot - Q)
+    #   d(CV)/dP_rot            = +(2/(K · d0²)) · tm_term² · (P_rot - Q)
+    # Rotate back for P's frame and flip sign for Q's frame. Then apply the
+    # centering correction: because Pc_a = P_a - mean_b(P_b), we have
+    #   d(CV)/d(P_a) = d(CV)/d(Pc_a) − (1/K) · Σ_b d(CV)/d(Pc_b)
+    # — i.e. subtract the per-pair mean gradient. Without this the CV's
+    # translation-invariance would leak into a 4% residual drift.
+    inv_K_d02 = (2.0 / (float(K) * (d0_t * d0_t)))
+    coeff = (tm_terms * tm_terms).unsqueeze(-1) * inv_K_d02     # [P, K, 1]
+    grad_P_rot = coeff * diff                                   # [P, K, 3]
+    grad_P_sub = grad_P_rot @ R.transpose(-2, -1)               # [P, K, 3] in P's frame
+    grad_Q_sub = -grad_P_rot                                    # same magnitude, no rotation
+    grad_P_sub = grad_P_sub - grad_P_sub.mean(dim=-2, keepdim=True)
+    grad_Q_sub = grad_Q_sub - grad_Q_sub.mean(dim=-2, keepdim=True)
+
+    # Scatter back to [B, N, 3]. The CV restricts to selected atoms (idx);
+    # unselected atoms receive zero gradient.
+    sub_grad_per_sample = torch.zeros(B, K, 3, device=device, dtype=sub.dtype)
+    sub_grad_per_sample.index_add_(0, ii, grad_P_sub)
+    sub_grad_per_sample.index_add_(0, jj, grad_Q_sub)
+    sub_grad_per_sample = sub_grad_per_sample / float(B - 1)
+
+    gradient = torch.zeros(B, n_atom, 3, device=device, dtype=sub.dtype)
+    gradient.index_copy_(-2, idx, sub_grad_per_sample)
+
+    # Boltz-style max-per-atom-norm = 1.0 normalisation.
+    g_norms = gradient.norm(dim=-1)
+    max_norm = g_norms.max()
+    if max_norm > 1e-8:
+        gradient = gradient / max_norm
+    return cv.to(dtype).detach(), gradient.to(dtype).detach()
+
+
+CV_REGISTRY["pair_tm"] = pair_tm_cv
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# pair_itm — interface-TM diversity for multimers
+#
+# Port of the user's GPU iTM impl
+# (MassiveFoldClustering_Tool/massiveclustering/core/gpu/itm.py). Only
+# atoms within a distance cutoff of *another chain* contribute — the
+# CV rewards diverse *interface geometries* (docking pose shuffles)
+# rather than whole-fold changes. Especially effective on Ab-Ag and
+# other multimer targets where the intra-chain fold is near-rigid and
+# the interesting variation lives at chain-chain interfaces.
+#
+# feats must carry either:
+#   - ``chain_id`` : [N] int tensor of chain indices (preferred), or
+#   - ``asym_id``  : same semantics, Protenix convention.
+# Caller can pass ``interface_cutoff`` (default 8Å).
+# ═══════════════════════════════════════════════════════════════════════
+
+def _interface_atom_mask(
+    coords: torch.Tensor,          # [B, N, 3] — detached sample(s)
+    chain_id: torch.Tensor,        # [N]
+    cutoff: float,
+) -> torch.Tensor:
+    """Atoms within ``cutoff`` Å of any atom on a different chain, in ANY sample.
+
+    The mask is the per-sample UNION (Codex P2): compute contacts sample-by-
+    sample, mark an atom as "interface" if it's within cutoff of another
+    chain in *at least one* sample. This catches docking-pose rearrangements
+    where different samples contact different surface patches (previously we
+    averaged coords first, which could miss every sample's actual interface
+    by placing chains at an unphysical midpoint).
+
+    Memory: cdist over full [N, N] per sample; we batch across samples with
+    no_grad and torch.cuda.empty_cache fallback for very large multimers.
+    """
+    with torch.no_grad():
+        device = coords.device
+        diff_chain = chain_id.unsqueeze(0) != chain_id.unsqueeze(1)  # [N, N]
+        N = coords.shape[-2]
+        out = torch.zeros(N, dtype=torch.bool, device=device)
+        for b in range(coords.shape[0]):
+            c = coords[b].float()
+            d = torch.cdist(c, c)                      # [N, N]
+            hit = (d < float(cutoff)) & diff_chain
+            out = out | hit.any(dim=1)
+            del d, hit
+        return out
+
+
+def pair_itm_cv(
+    coords: torch.Tensor,
+    feats: dict[str, Any],
+    *,
+    interface_cutoff: float = 8.0,
+    d0: Optional[float] = None,
+    **_: Any,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-sample ``1 - mean(TM_interface(i, j))`` across the batch.
+
+    Falls back to plain ``pair_tm`` when chain info is missing (monomer)
+    or when no interface atoms survive the cutoff filter.
+    """
+    n_atom = coords.shape[-2]
+    device = coords.device
+
+    # Protenix stores per-token (residue/ligand) ``asym_id`` and a
+    # ``atom_to_token_idx`` table mapping each atom → its token. We
+    # need per-atom chain ids here so gather asym_id through that map.
+    chain_id = feats.get("chain_id")
+    if chain_id is None and "asym_id" in feats and "atom_to_token_idx" in feats:
+        asym = feats["asym_id"]
+        a2t = feats["atom_to_token_idx"]
+        while asym.dim() > 1:
+            asym = asym[0]
+        while a2t.dim() > 1:
+            a2t = a2t[0]
+        asym = asym.to(device=device, dtype=torch.long)
+        a2t = a2t.to(device=device, dtype=torch.long)
+        if a2t.shape[0] == n_atom:
+            chain_id = asym[a2t]
+    if chain_id is None:
+        return pair_tm_cv(coords, feats, d0=d0)
+    chain_id = chain_id.to(device=device, dtype=torch.long)
+    while chain_id.dim() > 1:
+        chain_id = chain_id[0]
+    if chain_id.shape[0] != n_atom:
+        # Shape mismatch (e.g., per-token asym without an atom_to_token
+        # map) — safest degradation is plain pair_tm.
+        return pair_tm_cv(coords, feats, d0=d0)
+
+    pad_mask = _resolve_atom_mask(feats, n_atom, device)
+    iface = _interface_atom_mask(coords, chain_id, interface_cutoff) & pad_mask
+    if int(iface.sum().item()) < 4:
+        return pair_tm_cv(coords, feats, d0=d0)
+
+    new_feats = dict(feats)
+    new_feats["atom_selection_mask"] = iface
+    return pair_tm_cv(coords, new_feats, d0=d0)
+
+
+CV_REGISTRY["pair_itm"] = pair_itm_cv
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -690,17 +1049,30 @@ def sasa_cv(
         visibility = not_buried.prod(dim=-1)
         return visibility.reshape(*centres_all.shape[:-2], n_c, n_quad).mean(dim=-1)
 
-    from torch.utils.checkpoint import checkpoint
-
+    # ``torch.utils.checkpoint`` interacts badly with the outer
+    # ``@torch.no_grad()`` inference decorator: the CV is invoked
+    # inside our ``torch.enable_grad`` scope (see potentials._invoke_cv),
+    # but checkpoint re-enters ``torch.autograd.Function.apply`` which
+    # re-checks the ambient grad state and silently crashes the process
+    # when the surrounding graph was built while no_grad was the default.
+    # For realistic sizes (n_atom ≤ ~1200 with n_quad=48) the peak memory
+    # of the non-checkpointed path fits comfortably, so skip checkpoint
+    # entirely unless the caller opts in via ``use_checkpoint=True``.
+    # Only very large systems (>2000 atoms) need the memory savings.
+    use_checkpoint = bool(_.get("use_checkpoint", False))  # noqa: F821
     vis_chunks = []
-    for start in range(0, n_atom, chunk_size):
-        end = min(start + chunk_size, n_atom)
-        # `use_reentrant=False` is the non-legacy API; saves memory
-        # without any side-effects for this pure function.
-        vis_c = checkpoint(
-            _chunk_forward, sub, quad, start, end, use_reentrant=False,
-        )
-        vis_chunks.append(vis_c)
+    if use_checkpoint:
+        from torch.utils.checkpoint import checkpoint
+        for start in range(0, n_atom, chunk_size):
+            end = min(start + chunk_size, n_atom)
+            vis_c = checkpoint(
+                _chunk_forward, sub, quad, start, end, use_reentrant=False,
+            )
+            vis_chunks.append(vis_c)
+    else:
+        for start in range(0, n_atom, chunk_size):
+            end = min(start + chunk_size, n_atom)
+            vis_chunks.append(_chunk_forward(sub, quad, start, end))
     vis_per_atom = torch.cat(vis_chunks, dim=-1)
 
     sasa_total = (vis_per_atom * m).sum(dim=-1) * per_atom_area

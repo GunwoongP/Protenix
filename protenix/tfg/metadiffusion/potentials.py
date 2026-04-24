@@ -160,8 +160,19 @@ def _invoke_cv(
 
     The CV functions in :mod:`protenix.tfg.metadiffusion.cv` always
     detach both outputs, so this is a shim that just forwards.
+
+    CRITICAL: ``runner.inference.InferenceRunner.predict`` is decorated
+    with ``@torch.no_grad()``, which causes *any* tensor created inside
+    — even one we explicitly ``requires_grad_(True)`` — to be produced
+    without a ``grad_fn``. That makes ``torch.autograd.grad`` inside our
+    CV functions silently raise ``element 0 ... does not have a
+    grad_fn``, and the guarded ``except RuntimeError`` returns zeros.
+    End result: ALL CV-based guidance was being applied with zero
+    force across the whole diffusion. Forcing an ``enable_grad``
+    scope here restores the per-CV autograd path.
     """
-    value, grad = cv_function(coords, feats, **cv_kwargs)
+    with torch.enable_grad():
+        value, grad = cv_function(coords, feats, **cv_kwargs)
     return value, grad
 
 
@@ -192,11 +203,17 @@ def _apply_grad_mods(
     order = mods.get("modifier_order") or ["scaling", "projection"]
     if not scalers and not projectors:
         return grad
-    return apply_modifiers(
-        grad, coords, feats,
-        progress=_time_progress(params),
-        scalers=scalers, projectors=projectors, order=order,
-    )
+    # Modifier CVs (scaling + projection) also invoke autograd-backed
+    # CV functions under the outer ``@torch.no_grad()`` inference decorator,
+    # so — just like ``_invoke_cv`` — we need an explicit ``enable_grad``
+    # scope here or the modifier grads come back zero and effectively
+    # cancel the outer term's guidance (scalers) or no-op (projectors).
+    with torch.enable_grad():
+        return apply_modifiers(
+            grad, coords, feats,
+            progress=_time_progress(params),
+            scalers=scalers, projectors=projectors, order=order,
+        )
 
 
 def _resolve_cv_spec(
@@ -426,21 +443,170 @@ class MetadynamicsPotential(Potential):
 
     def __init__(self, default_params: Optional[dict[str, Any]] = None):
         defaults: dict[str, Any] = {
+            # Mode: "hills" (metadynamics with deposited Gaussians) or
+            # "repulsion" (stateless pairwise Gaussian kernel on per-
+            # sample CV values; Boltz explore_type="repulsion").
+            "explore_type": "hills",
             "hill_height": 0.5, "hill_sigma": 2.0, "hill_interval": 5,
             "well_tempered": False, "bias_factor": 10.0, "kT": 2.5,
             "max_hills": 1000,
             "warmup": 0.0, "cutoff": 0.75, "ensemble": False,
+            # Repulsion mode knobs (Boltz-equivalent):
+            "repulsion_strength": 1.0,
+            "repulsion_sigma": None,   # default: fall back to hill_sigma
         }
         if default_params:
             defaults.update(default_params)
         super().__init__(defaults)
         self.hills: list[dict[str, float]] = []
         self._call_counter = 0
+        self._hills_path: Optional[str] = None
+        self._hills_loaded_from_disk = False
+        # Index of the first NOT-YET-PERSISTED hill; save_hills only writes
+        # this tail so we don't re-emit (and duplicate) hills that already
+        # live on disk. Reset on every load or reset_hills.
+        self._hills_persisted_count = 0
 
     def reset_hills(self) -> None:
         """Clear history between independent runs."""
         self.hills.clear()
         self._call_counter = 0
+        self._hills_persisted_count = 0
+
+    # ─────────────────────────────────────────────────────────────────
+    # Cross-run persistence (true "avoid previously-visited" semantics)
+    # ─────────────────────────────────────────────────────────────────
+    def save_hills(self, path: str) -> None:
+        """Serialise the accumulated hill list to JSON.
+
+        Hills are tiny — each entry is a dict of four floats — so JSON
+        is fast, portable, and diffable. Call this at the end of a
+        run, then ``load_hills(path)`` at the start of the next run to
+        continue pushing the sampler away from previously-visited CV
+        regions. This is the cross-run analogue of within-run
+        metadynamics: across *different* Protenix invocations, each
+        new batch feels the cumulative bias of every batch before it.
+
+        Concurrency (Codex PR#2 P2 follow-up): the whole read-merge-
+        replace critical section is held under a single exclusive
+        ``flock`` on a sibling ``<path>.lock`` file, so two concurrent
+        processes never interleave reads/writes. We *don't* deduplicate
+        hills — metadynamics is explicitly additive: two visits to the
+        same CV value are two separate hills that linearly stack.
+        Instead we track how many of our in-memory hills were already
+        persisted (``self._hills_persisted_count``) and on each save
+        append only the tail, merging them with whatever appeared on
+        disk from peer processes. Falls back to the previous behaviour
+        silently when ``fcntl`` is unavailable.
+        """
+        import json, os, tempfile
+        try:
+            import fcntl
+            have_lock = True
+        except ImportError:
+            have_lock = False
+
+        lock_path = str(path) + ".lock"
+        lock_fd = None
+        if have_lock:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+        try:
+            # 1) Read whatever peer processes left on disk.
+            on_disk: list[dict[str, float]] = []
+            on_disk_counter = 0
+            if os.path.isfile(path):
+                try:
+                    with open(path, "r") as rf:
+                        blob = json.load(rf)
+                    on_disk = list(blob.get("hills", []))
+                    on_disk_counter = int(blob.get("call_counter", 0))
+                except Exception:
+                    on_disk = []
+                    on_disk_counter = 0
+
+            # 2) Figure out which of OUR in-memory hills are new since the
+            # last ``save_hills`` — those are the tail beyond
+            # ``_hills_persisted_count``. Everything before that index
+            # came from the previous load() or previous save(), so it
+            # (and any additions from peer processes) already lives on
+            # disk.
+            persisted_so_far = int(getattr(self, "_hills_persisted_count", 0))
+            our_new = self.hills[persisted_so_far:]
+
+            # 3) Union = on-disk contents (which already includes any
+            # peer additions + our previously-saved hills) + our NEW
+            # hills. No dedup by CV triple — metadynamics hills are
+            # additive and legitimate duplicates must survive.
+            merged_hills = on_disk + list(our_new)
+            merged_counter = max(int(self._call_counter), on_disk_counter)
+
+            # 4) Atomic replace.
+            d = os.path.dirname(os.path.abspath(path)) or "."
+            fd, tmp_path = tempfile.mkstemp(prefix=".hills.", suffix=".json", dir=d)
+            try:
+                with os.fdopen(fd, "w") as wf:
+                    json.dump({"hills": merged_hills,
+                               "call_counter": merged_counter}, wf)
+                os.replace(tmp_path, path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+
+            # 5) Now that our in-memory hills are safely on disk, update
+            # the watermark. (If peer hills were prepended we don't care
+            # — their contents are in merged_hills and our "new tail"
+            # count was computed before that union.)
+            self._hills_persisted_count = len(self.hills)
+
+        finally:
+            if lock_fd is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+
+    def _save_on_exit(self) -> None:
+        """atexit hook — persist hills before the Protenix process dies."""
+        if not self._hills_path or not self.hills:
+            return
+        try:
+            self.save_hills(self._hills_path)
+            logger.info(
+                "[metadiff/Metad] saved %d hills to %s (exit hook)",
+                len(self.hills), self._hills_path,
+            )
+        except Exception as e:
+            logger.warning(
+                "[metadiff/Metad] save-on-exit failed: %s", e,
+            )
+
+    def load_hills(self, path: str, append: bool = True) -> None:
+        """Restore hills from a prior ``save_hills`` dump.
+
+        By default the loaded hills are *appended* to any existing
+        ones (so chained runs accumulate), but passing ``append=False``
+        resets to exactly the saved set.
+        """
+        import json, os
+        if not os.path.isfile(path):
+            return
+        with open(path) as f:
+            blob = json.load(f)
+        new_hills = list(blob.get("hills", []))
+        if append:
+            self.hills.extend(new_hills)
+        else:
+            self.hills = new_hills
+        # Carry over the call counter so hill_interval gating keeps
+        # advancing; a fresh run without this would re-deposit at
+        # step 1 and clobber the imported timeline.
+        self._call_counter = int(blob.get("call_counter", 0))
+        # Everything currently in ``self.hills`` is already on disk, so
+        # the next save_hills() starts appending from this point onward.
+        self._hills_persisted_count = len(self.hills)
 
     def _hill_bias(
         self, cv: torch.Tensor, sigma: float,
@@ -500,7 +666,16 @@ class MetadynamicsPotential(Potential):
         })
         max_h = max(1, int(max_hills))
         if len(self.hills) > max_h:
-            del self.hills[: len(self.hills) - max_h]
+            n_pruned = len(self.hills) - max_h
+            del self.hills[:n_pruned]
+            # Shift the persisted-watermark to match (Codex PR#2 round 2):
+            # if the prune drops entries we had previously persisted,
+            # ``_hills_persisted_count`` must be lowered by the same amount
+            # so ``self.hills[persisted_so_far:]`` still refers to the
+            # NEW (not-yet-saved) tail instead of going empty.
+            self._hills_persisted_count = max(
+                0, getattr(self, "_hills_persisted_count", 0) - n_pruned,
+            )
 
     def _eval(
         self,
@@ -509,6 +684,34 @@ class MetadynamicsPotential(Potential):
         params: dict[str, Any],
         need_grad: bool,
     ):
+        # Lazy-load hills from disk on the very first eval, if a path
+        # was configured in the YAML. This keeps the cross-run
+        # persistence flow simple — the user drops the same
+        # `hills_path` into every run's explore body and the bias
+        # surface accumulates across invocations.
+        if not self._hills_loaded_from_disk:
+            hp = params.get("hills_path")
+            if hp:
+                self._hills_path = str(hp)
+                try:
+                    self.load_hills(self._hills_path, append=True)
+                    _debug_log(
+                        "[metadiff/Metad] loaded %d hills from %s",
+                        len(self.hills), self._hills_path,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[metadiff/Metad] could not load hills from %s "
+                        "(%s); starting with empty history",
+                        self._hills_path, e,
+                    )
+            self._hills_loaded_from_disk = True
+            # Register a save-on-exit hook. Each run exits clean, so
+            # atexit is the reliable place to persist state.
+            if self._hills_path:
+                import atexit
+                atexit.register(self._save_on_exit)
+
         # CRITICAL (Copilot #2): MetadynamicsPotential is stateful.
         # TFG invokes potentials on BOTH the energy-only path (MC logp
         # estimate in `_logp_x0`) and the energy-and-grad path (actual
@@ -534,6 +737,7 @@ class MetadynamicsPotential(Potential):
             return _zero_energy_and_grad(coords) if need_grad else _zero_energy(coords)
         cv_function = get_cv(cv_name)
 
+        explore_type = str(params.get("explore_type", "hills")).lower()
         hill_sigma = float(params.get("hill_sigma", 2.0))
         hill_h0 = float(params.get("hill_height", 0.5))
         hill_interval = max(1, int(params.get("hill_interval", 5)))
@@ -544,6 +748,62 @@ class MetadynamicsPotential(Potential):
         ensemble = bool(params.get("ensemble", False))
 
         cv_value, cv_grad = _invoke_cv(cv_function, coords, feats, cv_kwargs)
+
+        # ── Repulsion branch (Boltz explore_type="repulsion") ──
+        # Stateless pairwise Gaussian on per-sample CV values:
+        #     E_i = (1/(N-1)) · Σ_{j≠i} strength · exp(-(s_i-s_j)²/(2σ²))
+        # Minimising this via OptPotential semantics pushes samples
+        # with similar CV values apart — "안 나왔던 값"으로 유도.
+        if explore_type == "repulsion":
+            if cv_value.ndim < 1 or cv_value.shape[0] < 2:
+                # Single sample — no pair to repel.
+                return _zero_energy_and_grad(coords) if need_grad else _zero_energy(coords)
+            strength = float(params.get("repulsion_strength",
+                                        params.get("strength", 1.0)))
+            sigma = float(params.get("repulsion_sigma") or hill_sigma)
+            s2_inv = 1.0 / (sigma * sigma + 1e-12)
+            B = cv_value.shape[0]
+
+            # [B, B] pairwise kernel on CV values; diag = 1 (self-pairs).
+            # Convention: ``diff[i, j] = cv[j] - cv[i]`` (the outer-subtract
+            # above evaluates to ``cv_value.unsqueeze(0)[i,j] - cv_value.unsqueeze(1)[i,j]``
+            # = ``cv[j] - cv[i]``). Keep this in mind when reading the
+            # gradient formula below.
+            diff = cv_value.unsqueeze(0) - cv_value.unsqueeze(1)   # [B, B]  diff[i,j]=s_j-s_i
+            kernel = torch.exp(-0.5 * diff * diff * s2_inv)
+            eye = torch.eye(B, device=diff.device, dtype=diff.dtype)
+            kernel_off = kernel * (1.0 - eye)
+
+            # Per-sample repulsion energy (mean over pairs → count-invariant).
+            energy = strength * kernel_off.sum(dim=-1) / float(B - 1)
+
+            if need_grad:
+                # dE_i/dCV_i = strength/(N-1) · Σ_{j≠i} d/ds_i exp(-(s_i-s_j)²/2σ²)
+                #            = strength/(N-1) · Σ_{j≠i} kernel_ij · -(s_i-s_j)/σ²
+                #            = strength/(N-1) · Σ_{j≠i} kernel_ij ·  (s_j-s_i)/σ²
+                #            = strength/(N-1) · Σ_{j≠i} kernel_ij ·  diff[i,j]/σ²
+                # NB: earlier versions had an extra minus which inverted the
+                # repulsion into attraction (Codex review P1).
+                dE_dCV = strength * (diff * s2_inv * kernel_off).sum(dim=-1) / float(B - 1)
+                broadcast_shape = dE_dCV.shape + (1, 1)
+                grad = dE_dCV.reshape(broadcast_shape) * cv_grad
+            else:
+                grad = None
+
+            if _debug_enabled(params):
+                _debug_log(
+                    "[metadiff/Metad-rep/%s] t=%.3f  CVs=%s  E_mean=%.4g",
+                    cv_name, _time_progress(params),
+                    [f"{v:.3f}" for v in cv_value.tolist()],
+                    float(energy.mean().item()),
+                )
+
+            if need_grad:
+                grad = _apply_grad_mods(grad, coords, feats, params)
+                return energy, grad
+            return energy
+
+        # Otherwise: hills mode (default, existing behaviour follows)
 
         # Deposit hill every `hill_interval` engine calls.
         # Hill center is always the batch-mean CV (hills are a
