@@ -468,10 +468,21 @@ class MetadynamicsPotential(Potential):
         self._hills_persisted_count = 0
 
     def reset_hills(self) -> None:
-        """Clear history between independent runs."""
+        """Clear history between independent runs.
+
+        Also resets the on-disk persistence state so that reusing the
+        same ``MetadynamicsPotential`` instance for a second run
+        (e.g. a test that calls ``reset_hills()`` between scenarios)
+        starts with an empty ledger and re-loads any configured
+        ``hills_path`` on the next ``_eval`` — without this the
+        atexit hook would still point at the first run's JSON
+        (Codex PR#3 round 4).
+        """
         self.hills.clear()
         self._call_counter = 0
         self._hills_persisted_count = 0
+        self._hills_path = None
+        self._hills_loaded_from_disk = False
 
     # ─────────────────────────────────────────────────────────────────
     # Cross-run persistence (true "avoid previously-visited" semantics)
@@ -541,6 +552,18 @@ class MetadynamicsPotential(Potential):
             # additive and legitimate duplicates must survive.
             merged_hills = on_disk + list(our_new)
             merged_counter = max(int(self._call_counter), on_disk_counter)
+
+            # Re-apply the FIFO cap on disk too (Codex PR#3 round 4):
+            # deposit_hill() already prunes self.hills to max_hills in
+            # memory, but without this on-disk grows unbounded across
+            # save/reload cycles, and ``load_hills`` would resurrect
+            # pruned entries on the next run — blowing past the
+            # configured cap.
+            max_h_cap = getattr(self, "_max_hills_cap", None)
+            if max_h_cap is None:
+                max_h_cap = int((self.defaults or {}).get("max_hills", 1000))
+            if len(merged_hills) > max_h_cap:
+                merged_hills = merged_hills[-max_h_cap:]
 
             # 4) Atomic replace.
             d = os.path.dirname(os.path.abspath(path)) or "."
@@ -665,6 +688,10 @@ class MetadynamicsPotential(Potential):
             "step": int(step_idx),
         })
         max_h = max(1, int(max_hills))
+        # Remember the most recent cap so save_hills can honour it too
+        # (otherwise the on-disk JSON grows past the in-memory limit
+        # across save/reload cycles — see Codex PR#3 round 4 item 3).
+        self._max_hills_cap = max_h
         if len(self.hills) > max_h:
             n_pruned = len(self.hills) - max_h
             del self.hills[:n_pruned]

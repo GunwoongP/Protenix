@@ -341,13 +341,19 @@ def _parse_region_spec(spec: str, atom_array) -> np.ndarray:
         return mask
 
     # Residue filter (parts[1] if present and non-empty).
+    # Accept comma-separated segments per Boltz grammar, e.g.
+    # ``A:5``, ``A:5-10``, ``A:5,20``, ``A:5-10,20,30-35``.
     if len(parts) >= 2 and parts[1]:
-        rs = parts[1]
-        if "-" in rs:
-            lo, hi = rs.split("-", 1)
-            res_sel = (atom_array.res_id >= int(lo)) & (atom_array.res_id <= int(hi))
-        else:
-            res_sel = atom_array.res_id == int(rs)
+        res_sel = np.zeros(n, dtype=bool)
+        for seg in parts[1].split(","):
+            seg = seg.strip()
+            if not seg:
+                continue
+            if "-" in seg:
+                lo, hi = seg.split("-", 1)
+                res_sel |= (atom_array.res_id >= int(lo)) & (atom_array.res_id <= int(hi))
+            else:
+                res_sel |= atom_array.res_id == int(seg)
     else:
         res_sel = np.ones(n, dtype=bool)
 
@@ -542,7 +548,9 @@ def build_metadiffusion_features(
         for k in ("contact_cutoff", "beta", "probe_radius", "atom_radius",
                   "n_quad", "chunk_size",
                   # pair_tm / pair_itm (Codex PR#2 round 2):
-                  "d0", "interface_cutoff"):
+                  "d0", "interface_cutoff",
+                  # sasa_cv memory knob (Codex PR#3 round 4):
+                  "use_checkpoint"):
             if k in body:
                 cv_kwargs[k] = body[k]
 
