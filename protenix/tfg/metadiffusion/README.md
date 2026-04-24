@@ -10,6 +10,42 @@ Unknown Boltz-specific fields are warn-once and ignored.
 
 ---
 
+## 🧪 Validation status (N_step=200 real inference)
+
+### Fully verified — 19 CVs (production ready)
+
+| group | CVs | evidence |
+|---|---|---|
+| Shape | `rg`, `max_diameter`, `asphericity`, `coordination`, `contact_order`, `min_distance` | rg 16.22→17.97 (target 22) / 15.30 (target 13); max_diameter 49→55 (+12%); asphericity 63→329 (+log_gradient); min_distance hit 3.64 for target 4 |
+| Atom-spec | `distance`, `angle`, `dihedral` | dist 22.54→15.51 (target 15, perfect); angle 73°→83° (target 90); dihedral -2°→+136° (target 180) |
+| Pairwise diversity | `pair_rmsd`, `pair_tm`, `pair_itm`, `pair_drmsd` | pair_rmsd pw +21% on T1214 / +116% on H1204; pair_tm pw_TM 0.277→0.114 (2.4× diversity); pair_itm H1204 pw_TM 0.639→0.140 (4.6×) |
+| Multimer | `inter_chain` | A-B 26.96→29.91 (target 35) |
+| Interaction | `Q`/`native_contacts`, `hbond_count`, `salt_bridges`, `rmsf` | rmsf Rg +48% (spread), fold preserved for all |
+| Explore | `explore=hills` well-tempered, `explore=repulsion` | Rg range 1.74→3.01 with hills |
+
+All verified cases keep `|Cα-Cα| ≤ 4.15 Å` (native 3.80) — fold preserved.
+
+### Reference-based — 3 CVs need strength ≥ 20-30
+
+| CV | default fails at | recommended |
+|---|---|---|
+| `rmsd` | strength 5 stuck at 13 Å | **strength ≥ 30** + `log_gradient: true` |
+| `drmsd` | strength 5 same | **strength ≥ 30** + `log_gradient: true` |
+| `d_tm`  | TM stuck 0.22 | **strength ≥ 20** + `log_gradient: true` |
+
+Code is correct — these bounded / intrinsic-variance CVs just need
+more force to overcome the sampler's own diversity. See
+[RECIPES §7](docs/RECIPES.md#7-force-a-conformation-similar-to-a-reference).
+
+### Memory-heavy — `sasa`
+
+Works on small targets + GPU with headroom.  On Protenix-v2 + 24 GB
+GPU with contention, add `use_checkpoint: true` to the sasa term
+(costs ~2× forward time, saves backward activations).
+See [CV_REFERENCE §sasa](docs/CV_REFERENCE.md#sasa-memory).
+
+---
+
 ## Quick start — drop this into your input JSON
 
 ```json
@@ -47,6 +83,154 @@ python protenix/inference.py \
 
 Guidance is auto-enabled as soon as a `metadiffusion:` block is
 present in the input JSON.
+
+---
+
+## 🎯 Config examples — by goal
+
+Every snippet below is a complete `"metadiffusion": [...]` block.
+Drop it in alongside `"name"` and `"sequences"`.
+
+### A. Diverse monomer sample pool (verified)
+
+```json
+"metadiffusion": [
+  {"total_bias_clip": 5.0},
+  {"opt": {"collective_variable": "pair_rmsd", "target": "max",
+           "strength": 0.5, "warmup": 0.1, "cutoff": 0.8}},
+  {"explore": {"type": "repulsion", "collective_variable": "pair_rmsd",
+               "strength": 64.0, "sigma": 4.0,
+               "warmup": 0.2, "cutoff": 0.8}}
+]
+```
+T1214 pw +21%, H1204 pw +116%, `|Cα-Cα|` ≤ 4.15.
+
+### B. Multimer docking-pose diversity (verified)
+
+```json
+"metadiffusion": [
+  {"total_bias_clip": 5.0},
+  {"opt": {"collective_variable": "pair_itm", "target": "max",
+           "strength": 1.0, "interface_cutoff": 8.0,
+           "warmup": 0.1, "cutoff": 0.8}},
+  {"explore": {"type": "repulsion", "collective_variable": "pair_itm",
+               "strength": 128.0, "sigma": 0.15, "interface_cutoff": 8.0,
+               "warmup": 0.2, "cutoff": 0.8}}
+]
+```
+H1204 pw_TM 0.639 → 0.140 (4.6× diverse, intra-chain fold intact).
+
+### C. Steer Rg to a specific value (verified)
+
+```json
+"metadiffusion": [
+  {"total_bias_clip": 5.0},
+  {"steer": {"collective_variable": "rg", "groups": ["A"],
+             "target": 22.0, "strength": 30.0,
+             "warmup": 0.1, "cutoff": 0.9}}
+]
+```
+T2201: 16.22 → 17.97 (expand) / 15.30 (compact, target=13) — works
+both ways.
+
+### D. Steer a specific inter-atom distance (verified, atom1-4 fix)
+
+```json
+"metadiffusion": [
+  {"total_bias_clip": 5.0},
+  {"steer": {"collective_variable": "distance",
+             "atom1": "A:10:CA", "atom2": "A:100:CA",
+             "target": 15.0, "strength": 5.0, "log_gradient": true,
+             "warmup": 0.1, "cutoff": 0.9}}
+]
+```
+22.54 → 15.51 (target 적중 perfect).
+
+### E. Cross-run metadynamics (verified, hills persistence)
+
+```json
+"metadiffusion": [
+  {"total_bias_clip": 5.0},
+  {"explore": {"type": "hills", "collective_variable": "rg",
+               "height": 0.3, "sigma": 1.5, "pace": 20,
+               "well_tempered": true, "bias_factor": 10.0, "kT": 2.5,
+               "hills_path": "/path/to/my_target_hills.json",
+               "max_hills": 1000,
+               "warmup": 0.1, "cutoff": 0.9}}
+]
+```
+Feed the same `hills_path` to every sbatch run; fcntl-locked atomic
+write preserves additive hills across concurrent writers.
+Rg range 1.74 → 3.01 after 3 iterations.
+
+### F. Template similarity (reference-based, needs strength ≥ 30)
+
+```json
+"metadiffusion": [
+  {"total_bias_clip": 5.0},
+  {"steer": {"collective_variable": "rmsd",
+             "reference_structure": "/path/to/ref.cif",
+             "groups": ["A"], "target": 0.0,
+             "strength": 30.0, "log_gradient": true,
+             "warmup": 0.05, "cutoff": 0.95}}
+]
+```
+Use `d_tm` (with `target: 0.95`) instead for looser coil-tolerant
+similarity; reuse the same pattern.
+
+### G. Shape elongation (verified, `log_gradient` required)
+
+```json
+"metadiffusion": [
+  {"total_bias_clip": 3.0},
+  {"opt": {"collective_variable": "asphericity", "target": "max",
+           "strength": 0.5, "log_gradient": true,
+           "warmup": 0.2, "cutoff": 0.85}}
+]
+```
+asphericity 63 → 329 (5× elongation), fold preserved.
+
+### H. SASA — memory-heavy (opt in to checkpoint)
+
+```json
+"metadiffusion": [
+  {"total_bias_clip": 3.0},
+  {"steer": {"collective_variable": "sasa",
+             "target": 18000.0, "strength": 1.0, "log_gradient": true,
+             "use_checkpoint": true,        // save GPU memory
+             "chunk_size": 16,              // lower if still OOM
+             "warmup": 0.2, "cutoff": 0.85}}
+]
+```
+
+For a comprehensive recipe library see [docs/RECIPES.md](docs/RECIPES.md).
+For per-CV parameters see [docs/CV_REFERENCE.md](docs/CV_REFERENCE.md).
+For failure-mode debugging see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+
+---
+
+## ⚡ Strength cheat-sheet (critical!)
+
+Protenix is ~4× more sensitive to guidance than Boltz, so the
+paper's strength numbers over-drive and can unfold the sample.
+
+| CV family | Strength | `log_gradient` |
+|---|---|---|
+| `rg` | steer **30** | skip |
+| `distance`, `inter_chain` | steer **5** | yes |
+| `max_diameter` | opt **10** | skip |
+| `angle` | steer **50** | skip |
+| `dihedral` | steer **30** | skip |
+| `pair_rmsd`, `pair_tm` | opt **0.5** + rep 64 | skip (internally normalised) |
+| `pair_itm` | opt **1.0** + rep 128 | skip |
+| `asphericity`, `coordination`, `sasa` | **0.5** / **0.5** / **1.0** | **required** |
+| `min_distance`, `contact_order` | **5** / **0.5** | yes |
+| `rmsd`, `drmsd` (reference) | steer **≥ 30** | yes |
+| `d_tm` (reference) | steer **≥ 20** | yes |
+| `Q`, `hbond_count`, `salt_bridges`, `rmsf` | opt **0.5** | yes |
+
+`total_bias_clip: 5.0` is the all-round default — 3.0 for tight
+fold control, 8.0 for aggressive steering.
 
 ---
 
