@@ -209,6 +209,101 @@ For failure-mode debugging see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md
 
 ---
 
+## 🧠 CV semantics — when each one helps
+
+### Pure shape (no reference needed)
+- **`rg`**: classic compaction/expansion. Steer to a target Rg or
+  bound the ensemble. Works either direction. Recommended first
+  experiment — it's the gentlest knob.
+- **`max_diameter`** / **`asphericity`**: rod-like vs spherical
+  selection. `max_diameter opt max` stretches; `asphericity opt
+  max` produces elongated samples. Use `log_gradient` for
+  asphericity — its raw gradient scales with CV² and will explode
+  the fold otherwise.
+- **`coordination`**: packing density. `opt max` gives tighter
+  cores; `opt min` gives loose chains. Use with `log_gradient`.
+- **`min_distance`**: prevents clashes (target ~4 Å) or forces
+  contacts (target lower). One number per structure.
+- **`contact_order`**: short-range vs long-range topology. Useful
+  to bias toward β-sheet (low CO) vs complex topology (high CO).
+
+### Surface area
+- **`sasa`**: Shrake–Rupley solvent surface area. Increasing
+  SASA fundamentally requires backbone exposure → expect mild
+  unfolding. Decrease only works for *small* changes (<5%) at
+  very low strength (0.0001) because the diffusion prior already
+  produces compact samples; further compaction is hard.
+  See `docs/CV_REFERENCE.md` for `use_checkpoint` memory note.
+
+### Pairwise diversity (need batch B ≥ 2)
+- **`pair_rmsd`** (Kabsch): the workhorse. Use opt+rep for
+  decoy generation. Tip: at our scale, opt strength 0.5 +
+  repulsion strength 64 is the sweet spot.
+- **`pair_drmsd`** (distance matrix): rotation-invariant by
+  construction; gentler than `pair_rmsd`. Use when you want
+  shape diversity without orientation getting tangled.
+- **`pair_tm`** (ported from MassiveFoldClustering_Tool): bounded
+  TM-score-based diversity. Better than `pair_rmsd` when samples
+  are at risk of unfolding — TM doesn't reward extended coil.
+- **`pair_itm`** (interface-only TM): for **multimers** only.
+  Diversifies docking poses while keeping intra-chain fold rigid.
+  Specify `interface_cutoff: 8.0` (Å, default).
+
+### Multimer
+- **`inter_chain`**: chain–chain COM distance. `groups: [A, B]`.
+  Steer to push chains apart or pull them together.
+
+### Reference-based (need a reference CIF)
+- **`rmsd`** (Kabsch): pull samples toward / away from a known
+  structure. Strong, direction-correct. Use **strength ≥ 30**
+  with `log_gradient: true`.
+- **`drmsd`**: rotation-invariant analogue. Same strength range.
+- **`d_tm`** (`tm` alias): pull samples toward a target TM-score.
+  Bounded function — flat gradient at far distances; use **after**
+  `rmsd` has pulled into the same basin. Effective for fine-tuning
+  near TM > 0.7.
+- **`native_contacts`** (`Q` alias): fraction of native contacts
+  preserved. `opt max` keeps contacts; `opt min` breaks them.
+
+### Geometry primitives (atom-based)
+- **`distance`** (`atom1`, `atom2`): one COM-COM distance.
+  Standard region grammar (`A:10:CA`, etc.). Steer to specific
+  distances. *Verified*: 22.54 → 15.51 at strength 5.
+- **`angle`** (`atom1`, `atom2`, `atom3`): 3-atom angle in
+  radians. `target: 1.5708` for 90°. Strength 50 works.
+- **`dihedral`** (`atom1..4`): 4-atom torsion in radians.
+  Strength 30 works.
+
+### Interaction count
+- **`hbond_count`**, **`salt_bridges`**: rough heavy-atom-only
+  proxies. `opt max` to encourage; not for precise tuning.
+- **`rmsf`**: per-residue fluctuation across the batch. `opt
+  max` to spread samples spatially without changing pairwise
+  RMSD distribution dramatically.
+
+### Explore (sample-coupled)
+- **`explore type=hills`** (well-tempered metadynamics): on a
+  scalar CV, deposit Gaussian penalties at the visited locations
+  so the next iteration avoids them. Use `hills_path:
+  /path/to/hills.json` to persist across sbatch runs.
+- **`explore type=repulsion`**: between-sample Gaussian repulsion
+  in CV space. Standalone (without an `opt` term) it pushes
+  current-batch samples apart in CV-space; combined with
+  `opt: target=max` it amplifies the diversity push.
+
+### Phase D — Gradient modifiers (advanced)
+- **`scaling`**: weight the per-atom gradient by another CV's
+  gradient magnitude. E.g. scale the diversity force *down* in
+  high-`contact_order` regions to keep the core packed.
+- **`projection`**: project onto or away from another CV's
+  direction. E.g. project the diversity force *away* from `rg`
+  so the overall protein size stays fixed while the topology
+  diversifies.
+- **`modifier_order`**: `["scaling", "projection"]` (default) or
+  reversed.
+
+---
+
 ## ⚡ Strength cheat-sheet (critical!)
 
 Protenix is ~4× more sensitive to guidance than Boltz, so the
