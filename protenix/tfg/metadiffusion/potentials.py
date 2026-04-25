@@ -353,6 +353,18 @@ class SteeringPotential(Potential):
         # cv_value : [...]  (batch shape)
         # cv_grad  : [..., N_atom, 3]
 
+        # Symmetric with OptPotential: scale-invariant log_gradient
+        # rescaling. Critical for CVs whose raw gradient magnitude
+        # depends on the value scale (e.g. ``sasa`` with values in
+        # the 10⁴ Å² range). Without this, ``steer`` with ``sasa`` /
+        # ``asphericity`` / ``coordination`` applies an enormous force
+        # in the first diffusion step regardless of the configured
+        # strength, blowing up the fold even at strength 0.05.
+        if bool(params.get("log_gradient", False)):
+            g_norm = cv_grad.norm(dim=-1, keepdim=True)
+            max_norm = g_norm.flatten(start_dim=-2).amax(dim=-1, keepdim=True).unsqueeze(-1)
+            cv_grad = cv_grad / max_norm.clamp_min(1e-8)
+
         if ensemble and cv_value.ndim >= 1:
             n = max(cv_value.numel(), 1)
             cv_for_loss = cv_value.mean()
